@@ -1,0 +1,30 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build my app",
+            "type": "shell",
+            "command": "g++",
+            "args": [
+                "-fopenmp",
+                "-g",
+                "src/TextureBorderGenerator.cpp",
+                "-o",
+                "MyApp.exe",
+                "-I",
+                "libs/stb",
+                "-I",
+                "libs/tinigltf",
+                "-L",
+                "libs/stb",
+                "-L",
+                "libs/tinigltf"
+
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        }
+    ]
+}
