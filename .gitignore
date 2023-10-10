@@ -1,0 +1,6 @@
+libs/*
+!libs/.gitkeep
+data/*
+!data/.gitkeep
+.vscode/*
+.Python/*
