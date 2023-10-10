@@ -553,7 +553,7 @@ void FindSeamEdges(const Mesh& mesh, std::vector<SeamEdge>& seamEdges, int W, in
 			if(idx_v0 < 0 || idx_v0 >= mesh.verts.size() || 
 			idx_v1 < 0 || idx_v1 >= mesh.verts.size() || 
 			idx_uv0 < 0 || idx_uv0 >= mesh.uvs.size() || 
-			idx_uv1 < 0 || idx_uv1 >= mesh.uvs.size()) 
+			idx_uv1 < 0 || idx_uv1 >= mesh.uvs.size())  
 			{
 				std::cerr << "Invalid vertex or UV index encountered!" << std::endl;
 				continue;  // Skip this edge
