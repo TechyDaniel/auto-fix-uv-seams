@@ -29,8 +29,10 @@ THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR I
 #include <unordered_map>
 #include <chrono>
 #include <xmmintrin.h>
-
-
+#include <set>
+#include <algorithm> // for std::max
+#include <cmath>
+#include <fstream>
 
 #include <iostream>
 using namespace std;
@@ -42,21 +44,22 @@ const float TOLERANCE = 0.1f;
 
 #define USE_ISPC 0
 
-#define min(x,y) ((x) < (y) ? (x) : (y))
-#define max(x,y) ((x) > (y) ? (x) : (y))
+// #define min(x,y) ((x) < (y) ? (x) : (y))
+// #define max(x,y) ((x) > (y) ? (x) : (y))
 
-#define min3(x,y,z) min((x), min((y),(z)))
-#define max3(x,y,z) max((x), max((y),(z)))
+// #define min3(x,y,z) min((x), min((y),(z)))
+// #define max3(x,y,z) max((x), max((y),(z)))
 
 // Convenience for accessing 2D regular data (e.g. images)
-template<typename T>
+
+template <typename T>
 struct array2d
 {
 	std::unique_ptr<T[]> data;
 	int width, height;
-	array2d(int width, int height, T zero = T()) : data(new T[width*height]), width(width), height(height)
+	array2d(int width, int height, T zero = T()) : data(new T[width * height]), width(width), height(height)
 	{
-		for (int i = 0; i < width*height; ++i)
+		for (int i = 0; i < width * height; ++i)
 		{
 			data[i] = zero;
 		}
@@ -64,34 +67,40 @@ struct array2d
 
 	array2d(std::unique_ptr<T[]> data, int width, int height) : data(data.release()), width(width), height(height) {}
 
-	T& operator()(int column, int row)
+	T &operator()(int column, int row)
 	{
-		return data[row*width + column];
+		return data[row * width + column];
 	}
 
 	T operator()(int column, int row) const
 	{
-		return data[row*width + column];
+		return data[row * width + column];
 	}
 };
+
+float RoundToDecimal(float value, int decimalPlaces)
+{
+	float scale = pow(10.0f, decimalPlaces);
+	return round(value * scale) / scale;
+}
 
 // Dense vector of arbitrary length.
 struct VectorX
 {
 	std::unique_ptr<float[]> vec;
 	size_t size;
-	
-	VectorX(const VectorX& other) : vec(new float[other.size]), size(other.size)
+
+	VectorX(const VectorX &other) : vec(new float[other.size]), size(other.size)
 	{
-		memcpy(vec.get(), other.vec.get(), size*sizeof(float));		
+		memcpy(vec.get(), other.vec.get(), size * sizeof(float));
 	}
 
-	VectorX(size_t size) : vec(new float[size]), size(size) 
+	VectorX(size_t size) : vec(new float[size]), size(size)
 	{
-		memset(vec.get(), 0, sizeof(float)*size);		
+		memset(vec.get(), 0, sizeof(float) * size);
 	}
 
-	VectorX& operator=(const VectorX& other)
+	VectorX &operator=(const VectorX &other)
 	{
 		if (this != &other)
 		{
@@ -100,13 +109,13 @@ struct VectorX
 				vec.reset(new float[other.size]);
 				size = other.size;
 			}
-			memcpy(vec.get(), other.vec.get(), size*sizeof(float));
+			memcpy(vec.get(), other.vec.get(), size * sizeof(float));
 		}
 		return *this;
 	}
 
-	__forceinline float operator[](size_t ix) const	{ return vec[ix]; }
-	__forceinline float& operator[](size_t ix) { return vec[ix]; }
+	__forceinline float operator[](size_t ix) const { return vec[ix]; }
+	__forceinline float &operator[](size_t ix) { return vec[ix]; }
 
 	/**
 	 * Subtracts the elements of two vectors and stores the result in the output vector.
@@ -117,15 +126,15 @@ struct VectorX
 	 *
 	 * @throws None.
 	 */
-	static void Sub(VectorX& out, const VectorX& x, const VectorX& y)
+	static void Sub(VectorX &out, const VectorX &x, const VectorX &y)
 	{
 		assert(out.size == x.size);
 		assert(x.size == y.size);
 		for (size_t i = 0; i < x.size; ++i)
-			out.vec[i] = x.vec[i] - y.vec[i];		
+			out.vec[i] = x.vec[i] - y.vec[i];
 	}
 
-	static void Add(VectorX& out, const VectorX& x, const VectorX& y)
+	static void Add(VectorX &out, const VectorX &x, const VectorX &y)
 	{
 		assert(out.size == x.size);
 		assert(x.size == y.size);
@@ -133,32 +142,33 @@ struct VectorX
 			out.vec[i] = x.vec[i] + y.vec[i];
 	}
 
-	static void Mul(VectorX& out, const VectorX& x, float s)
+	static void Mul(VectorX &out, const VectorX &x, float s)
 	{
 		assert(out.size == x.size);
 		for (size_t i = 0; i < x.size; ++i)
-			out.vec[i] = x.vec[i]*s;
+			out.vec[i] = x.vec[i] * s;
 	}
 
-	static float Dot(const VectorX& a, const VectorX& b)
+	static float Dot(const VectorX &a, const VectorX &b)
 	{
 		assert(a.size == b.size);
 		size_t n = a.size;
-		
+
 		if (n > 4000)
 		{
-			const int NumChunks =  4;
+			const int NumChunks = 4;
 			int chunkSize = (int)n / NumChunks;
 
 			float dotProducts[NumChunks];
-			#pragma omp parallel for
-			for(int i = 0; i < n; i++) {
-				int count = i != NumChunks-1 ? chunkSize : (int)n - chunkSize * (NumChunks - 1); // Treat last chunk separately
-				size_t start = i*chunkSize;				
-				float* aArray = a.vec.get() + start;
-				float* bArray = b.vec.get() + start;
+#pragma omp parallel for
+			for (int i = 0; i < n; i++)
+			{
+				int count = i != NumChunks - 1 ? chunkSize : (int)n - chunkSize * (NumChunks - 1); // Treat last chunk separately
+				size_t start = i * chunkSize;
+				float *aArray = a.vec.get() + start;
+				float *bArray = b.vec.get() + start;
 #if USE_ISPC
-				dotProducts[i] = ispc::dot(aArray, bArray, count);			
+				dotProducts[i] = ispc::dot(aArray, bArray, count);
 #else
 				float sum = 0;
 				for (int j = 0; j < count; ++j)
@@ -187,9 +197,9 @@ struct VectorX
 	}
 
 	// Returns v*a + b
-	static void MulAdd(VectorX& out, const VectorX& v, float a, const VectorX& b)
+	static void MulAdd(VectorX &out, const VectorX &v, float a, const VectorX &b)
 	{
-		assert(out.size == v.size);		
+		assert(out.size == v.size);
 #if USE_ISPC
 		ispc::vmadd(v.vec.get(), a, b.vec.get(), out.vec.get(), (int)v.size);
 #else
@@ -205,32 +215,34 @@ struct VectorX
 struct SparseMat
 {
 	SparseMat(int numRows, int numCols) : rows(new Row[numRows]), numRows(numRows), numCols(numCols) {}
-	float& operator()(size_t row, size_t column)
+	float &operator()(size_t row, size_t column)
 	{
-		assert(row < numRows); assert(row >= 0);
-		assert(column < numCols); assert(column >= 0);
+		assert(row < numRows);
+		assert(row >= 0);
+		assert(column < numCols);
+		assert(column >= 0);
 		return rows[(int)row][(int)column];
 	}
 
-static void Mul(VectorX& out, const SparseMat& A, const VectorX& x)
-{
-    assert(out.size == A.numRows);
-    assert(x.size == A.numCols);
+	static void Mul(VectorX &out, const SparseMat &A, const VectorX &x)
+	{
+		assert(out.size == A.numRows);
+		assert(x.size == A.numCols);
 
-    #pragma omp parallel for schedule(static, 100)
-    for(size_t r = 0; r < A.numRows; r++) {
-        out[r] = Dot(x, A.rows[r]);
-    }
-}
-
+#pragma omp parallel for schedule(static, 100)
+		for (size_t r = 0; r < A.numRows; r++)
+		{
+			out[r] = Dot(x, A.rows[r]);
+		}
+	}
 
 private:
 	struct Row
 	{
-		template<typename T>
+		template <typename T>
 		struct AlignedDeleter
 		{
-			void operator()(T* ptr) { _aligned_free(ptr); }
+			void operator()(T *ptr) { _aligned_free(ptr); }
 		};
 
 		size_t n = 0;
@@ -238,9 +250,9 @@ private:
 		std::unique_ptr<float[], AlignedDeleter<float>> coeffs;
 		std::unique_ptr<int[], AlignedDeleter<int>> indices;
 
-		float& operator[](int column)
-		{			
-			// Find the element 
+		float &operator[](int column)
+		{
+			// Find the element
 			size_t index = findClosestIndex(column);
 			if (n == 0 || indices[index] != column) // Add new element
 			{
@@ -261,45 +273,45 @@ private:
 					indices[i] = prevIndex;
 					prevCoeff = tmpCoeff;
 					prevIndex = tmpIndex;
-				}				
-			}		
-			return coeffs[index];				
+				}
+			}
+			return coeffs[index];
 		}
 
 		void grow()
 		{
-			capacity = capacity == 0 ? 16 : capacity + capacity/2;			
-			float* newCoeffs = (float*)_aligned_malloc(sizeof(float)*capacity, 32);
-			int* newIndices = (int*)_aligned_malloc(sizeof(int)*capacity, 32);
+			capacity = capacity == 0 ? 16 : capacity + capacity / 2;
+			float *newCoeffs = (float *)_aligned_malloc(sizeof(float) * capacity, 32);
+			int *newIndices = (int *)_aligned_malloc(sizeof(int) * capacity, 32);
 
 			// Copy existing data over
-			memcpy(newCoeffs, coeffs.get(), n*sizeof(float));
-			memcpy(newIndices, indices.get(), n*sizeof(int));
+			memcpy(newCoeffs, coeffs.get(), n * sizeof(float));
+			memcpy(newIndices, indices.get(), n * sizeof(int));
 
 			coeffs.reset(newCoeffs);
-			indices.reset(newIndices);			
+			indices.reset(newIndices);
 		}
 
 		size_t findClosestIndex(int columnIndex)
-		{            
-                	for (int i = 0; i < n; ++i)
+		{
+			for (int i = 0; i < n; ++i)
 			{
 				if (indices[i] >= columnIndex)
 					return i;
 			}
-			return n;	
+			return n;
 		}
 	};
 
 	std::unique_ptr<Row[]> rows;
 	int numRows, numCols;
 
-	static float Dot(const VectorX& x, const Row& row)
-	{	
+	static float Dot(const VectorX &x, const Row &row)
+	{
 		float sum = 0.0f;
 		for (size_t i = 0; i < row.n; ++i)
 		{
-			sum += x[row.indices[i]]*row.coeffs[i];
+			sum += x[row.indices[i]] * row.coeffs[i];
 		}
 		return sum;
 	}
@@ -309,37 +321,37 @@ struct Vec3
 {
 	float x, y, z;
 
-	bool operator==(const Vec3& other) const
+	bool operator==(const Vec3 &other) const
 	{
 		return other.x == x && other.y == y && other.z == z;
 	}
 
-	bool operator!=(const Vec3& other) const
+	bool operator!=(const Vec3 &other) const
 	{
-		return  !(*this == other);
-	} 
-
-	Vec3 operator-(const Vec3& other) const
-	{
-		return Vec3{ x - other.x, y - other.y, z - other.z };
+		return !(*this == other);
 	}
 
-	Vec3 operator+(const Vec3& other) const
+	Vec3 operator-(const Vec3 &other) const
 	{
-		return Vec3{ x + other.x, y + other.y, z + other.z };
+		return Vec3{x - other.x, y - other.y, z - other.z};
 	}
 
-	void operator+=(const Vec3& other)
+	Vec3 operator+(const Vec3 &other) const
+	{
+		return Vec3{x + other.x, y + other.y, z + other.z};
+	}
+
+	void operator+=(const Vec3 &other)
 	{
 		*this = *this + other;
 	}
 
-	Vec3 operator*(const float& s) const
+	Vec3 operator*(const float &s) const
 	{
-		return Vec3{ x*s, y*s, z*s };
+		return Vec3{x * s, y * s, z * s};
 	}
 
-	Vec3 operator/(const float& s) const
+	Vec3 operator/(const float &s) const
 	{
 		return *this * (1.0f / s);
 	}
@@ -348,51 +360,106 @@ struct Vec3
 struct Vec2
 {
 	float u, v;
-	bool operator==(const Vec2& other) const
+	bool operator==(const Vec2 &other) const
 	{
 		return other.u == u && other.v == v;
 	}
-	bool operator!=(const Vec2& other) const
+	bool operator!=(const Vec2 &other) const
 	{
-		return  !(*this == other);
+		return !(*this == other);
 	}
-	Vec2 operator-(const Vec2& other) const
+	Vec2 operator-(const Vec2 &other) const
 	{
-		return Vec2{ u - other.u, v - other.v };
+		return Vec2{u - other.u, v - other.v};
 	}
-	Vec2 operator+(const Vec2& other) const
+	Vec2 operator+(const Vec2 &other) const
 	{
-		return Vec2{ u + other.u, v + other.v };
+		return Vec2{u + other.u, v + other.v};
 	}
-	void operator+=(const Vec2& other)
+	void operator+=(const Vec2 &other)
 	{
-		u += other.u; v += other.v;
+		u += other.u;
+		v += other.v;
 	}
-	Vec2 operator*(const float& s) const
+	Vec2 operator*(const float &s) const
 	{
-		return Vec2{u*s, v*s};
+		return Vec2{u * s, v * s};
 	}
 
-	Vec2 operator/(const float& s) const
+	Vec2 operator/(const float &s) const
 	{
 		return *this * (1.0f / s);
 	}
 
 	float Length() const
 	{
-		return sqrtf(u*u + v*v);
+		return sqrtf(u * u + v * v);
 	}
 };
 
-Vec2 operator*(float s, const Vec2& x)
+Vec2 operator*(float s, const Vec2 &x)
 {
-	return x*s;
+	return x * s;
 }
 
 struct Face
 {
 	int v0, v1, v2, uv0, uv1, uv2;
 };
+
+struct Edge
+{
+	int vertexIndex1;
+	int vertexIndex2;
+	Vec3 pos1; // position of vertex 1
+	Vec3 pos2; // position of vertex 2
+};
+
+bool operator==(const Edge &e1, const Edge &e2)
+{
+	return (e1.vertexIndex1 == e2.vertexIndex1 && e1.vertexIndex2 == e2.vertexIndex2) ||
+		   (e1.vertexIndex1 == e2.vertexIndex2 && e1.vertexIndex2 == e2.vertexIndex1);
+}
+
+bool edgeExists(const Edge &e, const std::vector<Edge> &edges)
+{
+	for (const Edge &existingEdge : edges)
+	{
+		if (e == existingEdge)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+void addUniqueEdgeWithPosition(int v1, int v2, Vec3 pos1, Vec3 pos2, std::vector<Edge> &edges)
+{
+	Edge newEdge{min(v1, v2), max(v1, v2)};
+	newEdge.vertexIndex1 = v1;
+	newEdge.vertexIndex2 = v2;
+	newEdge.pos1 = pos1;
+	newEdge.pos2 = pos2;
+
+	edges.push_back(newEdge);
+}
+
+struct EdgeHasher
+{
+	std::hash<float> h;
+	size_t operator()(const std::tuple<Vec3, Vec3> &e) const
+	{
+		const Vec3 &a = std::get<0>(e);
+		const Vec3 &b = std::get<1>(e);
+
+		return h(a.x) ^ h(b.x) + 1733 * (h(a.y) ^ h(b.y)) + 43 * (h(a.z) ^ h(b.z));
+	}
+};
+
+bool AreEqual(const Vec2 &a, const Vec2 &b, float epsilon = 0.001f)
+{
+	return std::abs(a.u - b.u) < epsilon && std::abs(a.v - b.v) < epsilon;
+}
 
 struct HalfEdge
 {
@@ -402,8 +469,9 @@ struct HalfEdge
 Vec2 UVToScreen(Vec2 in, int W, int H)
 {
 	in.v = 1.0f - in.v;
-	in.u *= W; in.v *= H;
-	return in - Vec2{ 0.5f, 0.5f };
+	in.u *= W;
+	in.v *= H;
+	return in - Vec2{0.5f, 0.5f};
 }
 
 // Do a modulo operation with the assumption that it's usually a no-op
@@ -411,7 +479,7 @@ Vec2 UVToScreen(Vec2 in, int W, int H)
 int WrapCoordinate(int x, int size)
 {
 	// Branch predictor will hopefully skip these two loops most of the time
-	while (x < 0) 
+	while (x < 0)
 	{
 		x += size;
 	}
@@ -427,6 +495,11 @@ struct SeamEdge
 	// The two half edges representing this edge (each half edge is in a different UV chart)
 	HalfEdge edges[2];
 
+	static float max3(float a, float b, float c)
+	{
+		return std::max(a, std::max(b, c));
+	}
+
 	int numSamples(int W, int H) const
 	{
 		Vec2 e0 = UVToScreen(edges[0].b, W, H) - UVToScreen(edges[0].a, W, H);
@@ -440,159 +513,198 @@ struct Mesh
 {
 	std::vector<Face> faces;
 	std::vector<Vec3> verts;
-	std::vector<Vec2> uvs;	
+	std::vector<Vec2> uvs;
+	std::vector<Edge> edges;
 };
 
-bool LoadMesh(const char* fname, Mesh& mesh)
+bool LoadMesh(const char *fname, Mesh &mesh)
 {
-    tinygltf::Model model;
-    tinygltf::TinyGLTF loader;
-    std::string err;
-    std::string warn;
+	tinygltf::Model model;
+	tinygltf::TinyGLTF loader;
+	std::string err;
+	std::string warn;
 
-    bool ret = loader.LoadBinaryFromFile(&model, &err, &warn, fname);
+	bool ret = loader.LoadBinaryFromFile(&model, &err, &warn, fname);
 
-    // Handle warnings and errors...
+	// Handle warnings and errors...
 
-    if (!ret)
-        return false;
+	if (!ret)
+		return false;
 
-    // Assume the first mesh is the one you want
-    const tinygltf::Mesh& tmesh = model.meshes[0];
+	// Assume the first mesh is the one you want
+	const tinygltf::Mesh &tmesh = model.meshes[0];
 
-    // Assume the first primitive is the one you want
-    const tinygltf::Primitive& prim = tmesh.primitives[0];
+	// Assume the first primitive is the one you want
+	const tinygltf::Primitive &prim = tmesh.primitives[0];
 
-    // Extracting vertices (as an example, assuming they are 3-component float)
-    {
-        const tinygltf::Accessor& accessor = model.accessors[prim.attributes.find("POSITION")->second];
-        const tinygltf::BufferView& bufferView = model.bufferViews[accessor.bufferView];
-        const tinygltf::Buffer& buffer = model.buffers[bufferView.buffer];
+	// Extracting vertices (as an example, assuming they are 3-component float)
+	{
+		const tinygltf::Accessor &accessor = model.accessors[prim.attributes.find("POSITION")->second];
+		const tinygltf::BufferView &bufferView = model.bufferViews[accessor.bufferView];
+		const tinygltf::Buffer &buffer = model.buffers[bufferView.buffer];
 
-        const float* vertices = reinterpret_cast<const float*>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
-        size_t vertexCount = accessor.count;
+		const float *vertices = reinterpret_cast<const float *>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
+		size_t vertexCount = accessor.count;
 
-        for(size_t i = 0; i < vertexCount; i++) {
-            mesh.verts.push_back(Vec3{vertices[i*3+0], vertices[i*3+1], vertices[i*3+2]});
-        }
-    }
+		for (size_t i = 0; i < vertexCount; i++)
+		{
+			mesh.verts.push_back(Vec3{vertices[i * 3 + 0], vertices[i * 3 + 1], vertices[i * 3 + 2]});
+		}
+	}
 
-    // Extracting UVs (similar to vertices)
+	// Extracting UVs (similar to vertices)
+		// Extracting UVs
+	{
+		auto itTexCoords = prim.attributes.find("TEXCOORD_0");
+		if (itTexCoords != prim.attributes.end())
+		{
+			const tinygltf::Accessor &accessor = model.accessors[itTexCoords->second];
+			const tinygltf::BufferView &bufferView = model.bufferViews[accessor.bufferView];
+			const tinygltf::Buffer &buffer = model.buffers[bufferView.buffer];
 
-    // Extracting faces
-    {
-        const tinygltf::Accessor& accessor = model.accessors[prim.indices];
-        const tinygltf::BufferView& bufferView = model.bufferViews[accessor.bufferView];
-        const tinygltf::Buffer& buffer = model.buffers[bufferView.buffer];
+			const float *texcoords = reinterpret_cast<const float *>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
+			size_t uvCount = accessor.count;
 
-        const unsigned short* indices = reinterpret_cast<const unsigned short*>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
-        size_t indexCount = accessor.count;
+			for (size_t i = 0; i < uvCount; i++)
+			{
+				mesh.uvs.push_back(Vec2{(texcoords[i * 2 + 0]), (texcoords[i * 2 + 1])});
+			}
+		}
+		else
+		{
+			std::cerr << "Warning: No UV coordinates found in the mesh!" << std::endl;
+		}
+	}
 
-        for(size_t i = 0; i < indexCount; i += 3) {
-            mesh.faces.push_back(Face{indices[i+0], indices[i+1], indices[i+2], /* UV indices, if they exist */ });
-        }
-    }
+	// Extracting faces
+	{
+	const tinygltf::Accessor &accessor = model.accessors[prim.indices];
+	const tinygltf::BufferView &bufferView = model.bufferViews[accessor.bufferView];
+	const tinygltf::Buffer &buffer = model.buffers[bufferView.buffer];
 
-	// Extracting UVs
-{
-    auto itTexCoords = prim.attributes.find("TEXCOORD_0");
-    if (itTexCoords != prim.attributes.end()) {
-        const tinygltf::Accessor& accessor = model.accessors[itTexCoords->second];
-        const tinygltf::BufferView& bufferView = model.bufferViews[accessor.bufferView];
-        const tinygltf::Buffer& buffer = model.buffers[bufferView.buffer];
+	const unsigned short *indices = reinterpret_cast<const unsigned short *>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
+	size_t indexCount = accessor.count;
 
-        const float* texcoords = reinterpret_cast<const float*>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
-        size_t uvCount = accessor.count;
-
-        for(size_t i = 0; i < uvCount; i++) {
-            mesh.uvs.push_back(Vec2{texcoords[i*2+0], texcoords[i*2+1]});
-        }
-    }
-    else {
-        std::cerr << "Warning: No UV coordinates found in the mesh!" << std::endl;
-    }
-	}	
-    // Handling normals, etc., involves similar steps.
-
-    return true;
+	for (size_t i = 0; i < indexCount; i += 3)
+	{
+		// Assuming UV indices are the same as vertex indices
+		mesh.faces.push_back(Face{
+			(int)indices[i + 0], 
+			(int)indices[i + 1], 
+			(int)indices[i + 2], 
+			(int)indices[i + 0], 
+			(int)indices[i + 1], 
+			(int)indices[i + 2]
+		});
+	}
 }
 
-void FindSeamEdges(const Mesh& mesh, std::vector<SeamEdge>& seamEdges, int W, int H)
+
+	// Extracting edges
+	{
+		const tinygltf::Accessor &accessor = model.accessors[prim.indices];
+		const tinygltf::BufferView &bufferView = model.bufferViews[accessor.bufferView];
+		const tinygltf::Buffer &buffer = model.buffers[bufferView.buffer];
+		const float *positions = reinterpret_cast<const float *>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
+		const unsigned short *indices = reinterpret_cast<const unsigned short *>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
+		size_t indexCount = accessor.count;
+
+		for (size_t i = 0; i < indexCount; i += 3)
+		{
+			// Add face
+			mesh.faces.push_back(Face{indices[i + 0], indices[i + 1], indices[i + 2]});
+
+			// Get indices
+			int idx1 = indices[i + 0];
+			int idx2 = indices[i + 1];
+			int idx3 = indices[i + 2];
+
+			// Assuming each position is a set of 3 floats (x, y, z)
+			Vec3 pos1 = {positions[3 * idx1], positions[3 * idx1 + 1], positions[3 * idx1 + 2]};
+			Vec3 pos2 = {positions[3 * idx2], positions[3 * idx2 + 1], positions[3 * idx2 + 2]};
+			Vec3 pos3 = {positions[3 * idx3], positions[3 * idx3 + 1], positions[3 * idx3 + 2]};
+
+			// Add edges with positions
+			// NO unique , we add all
+			addUniqueEdgeWithPosition(idx1, idx2, pos1, pos2, mesh.edges);
+			addUniqueEdgeWithPosition(idx2, idx3, pos2, pos3, mesh.edges);
+			addUniqueEdgeWithPosition(idx3, idx1, pos3, pos1, mesh.edges);
+		}
+	}
+
+	// Handling normals, etc., involves similar steps.
+
+	return true;
+}
+
+void FindSeamEdges(const Mesh &mesh, std::vector<SeamEdge> &seamEdges, int W, int H)
 {
-	if (mesh.faces.empty()) {
-		std::cerr << "No faces in the mesh!" << std::endl;
+	std::ofstream logFile("seam.log", std::ios::app); // create a file stream
+    
+    if (!logFile) { // Check if file stream is in a valid state
+        std::cerr << "Could not open log file for writing!" << std::endl;
+        return;
+    } 
+
+	if (mesh.edges.empty())
+	{
+		std::cerr << "No edges in the mesh!" << std::endl;
 		return;
 	}
-	using namespace std;
-	struct tupleHasher // Hash pairs of vectors
-	{
-		hash<float> h;
-		size_t operator ()(const tuple<Vec3, Vec3> x) const
-		{			
-			Vec3 a = std::get<0>(x), b = std::get<1>(x);
-			return	h(a.x) + 1733 * h(a.y) + 43 * h(a.z) + 3257 * h(b.x) + 1091 * h(b.y) + 557 * h(b.z);
-		}
-	};
-	unordered_map<tuple<Vec3, Vec3>, tuple<Vec2, Vec2>, tupleHasher> edgeMap;
 
-	for (const auto& f : mesh.faces)
-	{
-		// Need to loop through the edges of this face, so make a list of all the edges, including their UVs		
-		tuple<int, int, int, int> edges[] = {
-			make_tuple(f.v0, f.v1, f.uv0, f.uv1),
-			make_tuple(f.v1, f.v2, f.uv1, f.uv2),
-			make_tuple(f.v2, f.v0, f.uv2, f.uv0)
-		};
+	// edgeMap should map edges to their UVs
+	// depending on your Edge structure, this mapping might require a custom hash function
+	unordered_map<tuple<Vec3, Vec3>, tuple<Vec2, Vec2>, EdgeHasher> edgeMap;
 
-		for (const auto& e : edges)
+		for (const auto &e : mesh.edges)
 		{
-			// Grab the actual verts and UVs. The mesh may not have been "welded" properly, so we have to check
-			// the actual coordinates rather than just indices.
-			int idx_v0 = get<0>(e), idx_v1 = get<1>(e), idx_uv0 = get<2>(e), idx_uv1 = get<3>(e);
+			Vec3 v0 = e.pos1, v1 = e.pos2;
+			Vec2 uv0 = mesh.uvs[e.vertexIndex1], uv1 = mesh.uvs[e.vertexIndex2];
 
-			if(idx_v0 < 0 || idx_v0 >= mesh.verts.size() || 
-			idx_v1 < 0 || idx_v1 >= mesh.verts.size() || 
-			idx_uv0 < 0 || idx_uv0 >= mesh.uvs.size() || 
-			idx_uv1 < 0 || idx_uv1 >= mesh.uvs.size())  
-			{
-				std::cerr << "Invalid vertex or UV index encountered!" << std::endl;
-				continue;  // Skip this edge
-			}
+			// Logging edge details
+            logFile << "Edge: v0: (" << v0.x << ", " << v0.y << ", " << v0.z << "), v1: (" << v1.x << ", " << v1.y << ", " << v1.z << ")" << std::endl;
+            logFile << "UVs: uv0: (" << uv0.u << ", " << uv0.v << "), uv1: (" << uv1.u << ", " << uv1.v << ")" << std::endl;
+			// Inspecting edgeMap: Print out every key-value pair in edgeMap
 
-			Vec3 v0 = mesh.verts[idx_v0], v1 = mesh.verts[idx_v1];
-			Vec2 uv0 = mesh.uvs[idx_uv0], uv1 = mesh.uvs[idx_uv1];
-
-			// Try to find the "opposite" edge (note: reversing the order of verts here)	
 			auto otherEdge = edgeMap.find(make_tuple(v1, v0));
 			if (otherEdge == edgeMap.end())
 			{
-				// First time we're seeing this edge, so add it to the map
+				logFile << "Adding" <<  std::endl;
 				edgeMap[make_tuple(v0, v1)] = make_tuple(uv0, uv1);
 			}
 			else
 			{
-				// This edge has already been added once, so we have enough information to see if it's a normal edge, or a "seam edge".
-				Vec2 otheruv0 = get<0>(otherEdge->second), otheruv1 = get<1>(otherEdge->second);
-				float epsilon = 1e-6f; // Adjust as needed
-				if (abs(otheruv0.u - uv1.u) > epsilon || abs(otheruv0.v - uv1.v) > epsilon || 
-					abs(otheruv1.u - uv0.u) > epsilon || abs(otheruv1.v - uv0.v) > epsilon)
+				// std::cout << "FOUND A DUPLICATE !!" <<  std::endl;
+				// Check if UVs are the same; if not, it's a seam
+				Vec2 otherUv0 = get<0>(otherEdge->second), otherUv1 = get<1>(otherEdge->second);
+				logFile << "Other UVs: otherUv0: (" << otherUv0.u << ", " << otherUv0.v << "), otherUv1: (" << otherUv1.u << ", " << otherUv1.v << ")" << std::endl;
+				if (otherUv0.u != uv1.u || otherUv0.v != uv1.v || otherUv1.u != uv0.u || otherUv1.v != uv0.v)
+
 				{
-					// UV don't match, so we have a seam
-					SeamEdge s = SeamEdge{ HalfEdge{ uv0, uv1 }, HalfEdge{ otheruv1, otheruv0 } };
+
+					logFile << "FOUND A SEAM " << std::endl;
+					// This is a seam, handle it accordingly
+					SeamEdge s = SeamEdge{HalfEdge{uv0, uv1}, HalfEdge{otherUv1, otherUv0}};
 					seamEdges.push_back(s);
-				}				
-				edgeMap.erase(otherEdge); // No longer need this edge, remove it to keep storage low
+					logFile << "Sample SeamEdge, first half-edge a: ("
+						<< seamEdges[0].edges[0].a.u << ", " << seamEdges[0].edges[0].a.v << "), b: ("
+						<< seamEdges[0].edges[0].b.u << ", " << seamEdges[0].edges[0].b.v << ")" << std::endl;
+				}
+
+				// Optionally remove the edge from the map if you no longer need it
+				// edgeMap.erase(otherEdge);
 			}
 		}
-	}
+	
+	 logFile.close();  // make sure to close the file stream when done writing
 }
 
 struct RGB
 {
 	unsigned char R, G, B;
-	unsigned char& operator[](size_t ix)
+	unsigned char &operator[](size_t ix)
 	{
-		return ((unsigned char*)this)[ix];
+		return ((unsigned char *)this)[ix];
 	}
 };
 
@@ -604,31 +716,39 @@ float clamp(float x, float lo, float hi)
 __forceinline Vec3 RGBToYCoCg(RGB color)
 {
 	return Vec3{
-		 color.R * 0.25f + color.G*0.5f + color.B*0.25f,
-		-color.R * 0.25f + color.G*0.5f - color.B*0.25f,
-		 color.R * 0.5f					- color.B*0.5f
-	};
+		color.R * 0.25f + color.G * 0.5f + color.B * 0.25f,
+		-color.R * 0.25f + color.G * 0.5f - color.B * 0.25f,
+		color.R * 0.5f - color.B * 0.5f};
 }
 
 __forceinline RGB YCoCgToRGB(Vec3 color)
 {
-	float r = clamp(color.x - color.y + color.z	, 0, 255);
-	float g = clamp(color.x + color.y			, 0, 255);
-	float b = clamp(color.x - color.y - color.z	, 0, 255);
-	return RGB{ (unsigned char)roundf(r),(unsigned char)roundf(g),(unsigned char)roundf(b) };
+	float r = clamp(color.x - color.y + color.z, 0, 255);
+	float g = clamp(color.x + color.y, 0, 255);
+	float b = clamp(color.x - color.y - color.z, 0, 255);
+	return RGB{(unsigned char)roundf(r), (unsigned char)roundf(g), (unsigned char)roundf(b)};
 }
 
 bool isInside(int x, int y, Vec2 ea, Vec2 eb)
 {
-	return (float)x*(eb.v - ea.v) - (float)y*(eb.u - ea.u) - ea.u*eb.v + ea.v*eb.u >= 0;
+	return (float)x * (eb.v - ea.v) - (float)y * (eb.u - ea.u) - ea.u * eb.v + ea.v * eb.u >= 0;
 }
 
-void RasterizeFace(Vec2 uv0, Vec2 uv1, Vec2 uv2, array2d<uint8_t>& coverageBuf)
-{	
+inline float min3(float x, float y, float z)
+{
+	return std::min({x, y, z});
+}
+
+inline float max3(float x, float y, float z)
+{
+	return std::max({x, y, z});
+}
+void RasterizeFace(Vec2 uv0, Vec2 uv1, Vec2 uv2, array2d<uint8_t> &coverageBuf)
+{
 	uv0 = UVToScreen(uv0, coverageBuf.width, coverageBuf.height);
 	uv1 = UVToScreen(uv1, coverageBuf.width, coverageBuf.height);
 	uv2 = UVToScreen(uv2, coverageBuf.width, coverageBuf.height);
-	
+
 	// Axis aligned bounds of the triangle
 	int minx = (int)min3(uv0.u, uv1.u, uv2.u);
 	int maxx = (int)max3(uv0.u, uv1.u, uv2.u) + 1;
@@ -644,7 +764,7 @@ void RasterizeFace(Vec2 uv0, Vec2 uv1, Vec2 uv2, array2d<uint8_t>& coverageBuf)
 	for (int y = miny; y <= maxy; ++y)
 	{
 		for (int x = minx; x <= maxx; ++x)
-		{			
+		{
 			if (isInside(x, y, e0a, e0b) & isInside(x, y, e1a, e1b) & isInside(x, y, e2a, e2b))
 			{
 				coverageBuf(WrapCoordinate(x, coverageBuf.width), WrapCoordinate(y, coverageBuf.height)) = 1;
@@ -653,60 +773,60 @@ void RasterizeFace(Vec2 uv0, Vec2 uv1, Vec2 uv2, array2d<uint8_t>& coverageBuf)
 	}
 }
 
-RGB DilatePixel(int centerx, int centery, const array2d<RGB>& image, const array2d<uint8_t>& coverageBuf)
+RGB DilatePixel(int centerx, int centery, const array2d<RGB> &image, const array2d<uint8_t> &coverageBuf)
 {
 	int numPixels = 0;
-	Vec3 sum = Vec3{ 0,0,0 };
+	Vec3 sum = Vec3{0, 0, 0};
 	for (int yix = centery - 1; yix <= centery + 1; ++yix)
 	{
 		for (int xix = centerx - 1; xix <= centerx + 1; ++xix)
 		{
 			int x = WrapCoordinate(xix, image.width);
 			int y = WrapCoordinate(yix, image.height);
-			if (coverageBuf(x,y))
+			if (coverageBuf(x, y))
 			{
 				++numPixels;
-				RGB c = image(x,y);
-				sum += Vec3{ (float)c.R, (float)c.G, (float)c.B };
+				RGB c = image(x, y);
+				sum += Vec3{(float)c.R, (float)c.G, (float)c.B};
 			}
 		}
 	}
 
 	if (numPixels > 0)
-	{	
+	{
 		sum = sum / (float)numPixels;
 		sum.x = min(255.0f, roundf(sum.x));
 		sum.y = min(255.0f, roundf(sum.y));
 		sum.z = min(255.0f, roundf(sum.z));
-		return RGB{ (unsigned char)sum.x, (unsigned char)sum.y, (unsigned char)sum.z };
+		return RGB{(unsigned char)sum.x, (unsigned char)sum.y, (unsigned char)sum.z};
 	}
 	else
 	{
-		return RGB{ 0,0,0 };
+		return RGB{0, 0, 0};
 	}
 }
 
 // Given a fractional sample location, compute the four integer sample locations and their weights
-void CalculateSamplesAndWeights(const array2d<int>& pixelMap, Vec2 &sample,  int *__restrict outIxs, float *__restrict outWeights)
+void CalculateSamplesAndWeights(const array2d<int> &pixelMap, Vec2 &sample, int *__restrict outIxs, float *__restrict outWeights)
 {
 	int truncu = (int)sample.u;
 	int truncv = (int)sample.v;
-	
-	const int xs[] = { truncu, truncu + 1, truncu + 1, truncu };
-	const int ys[] = { truncv, truncv, truncv + 1, truncv + 1 };
+
+	const int xs[] = {truncu, truncu + 1, truncu + 1, truncu};
+	const int ys[] = {truncv, truncv, truncv + 1, truncv + 1};
 	for (int i = 0; i < 4; ++i)
 	{
 		int x = WrapCoordinate(xs[i], pixelMap.width);
 		int y = WrapCoordinate(ys[i], pixelMap.height);
-		outIxs[i] = pixelMap(x,y);
+		outIxs[i] = pixelMap(x, y);
 	}
 
 	float fracX = sample.u - truncu;
 	float fracY = sample.v - truncv;
-	outWeights[0] = (1.0f - fracX)*(1.0f - fracY);
-	outWeights[1] = fracX*(1.0f - fracY);
-	outWeights[2] = fracX*fracY;
-	outWeights[3] = (1.0f - fracX)*fracY;
+	outWeights[0] = (1.0f - fracX) * (1.0f - fracY);
+	outWeights[1] = fracX * (1.0f - fracY);
+	outWeights[2] = fracX * fracY;
+	outWeights[3] = (1.0f - fracX) * fracY;
 	for (int i = 0; i < 4; ++i)
 	{
 		outWeights[i] *= EDGE_CONSTRAINTS_WEIGHT;
@@ -715,37 +835,37 @@ void CalculateSamplesAndWeights(const array2d<int>& pixelMap, Vec2 &sample,  int
 
 __forceinline float rcp(float x)
 {
-	__m128 tmp = _mm_load_ss(&x);	
+	__m128 tmp = _mm_load_ss(&x);
 	tmp = _mm_rcp_ss(tmp);
 	_mm_store_ss(&x, tmp);
 	return x;
 }
 
-void ConjugateGradientOptimize(VectorX& out, SparseMat& A, const VectorX& guess, const VectorX& b, int numIterations, float tolerance)
+void ConjugateGradientOptimize(VectorX &out, SparseMat &A, const VectorX &guess, const VectorX &b, int numIterations, float tolerance)
 {
 	size_t n = guess.size;
 	VectorX p(n), r(n), Ap(n), tmp(n);
-	VectorX& x = out;
+	VectorX &x = out;
 
 	// r = b - A*x;
 	SparseMat::Mul(tmp, A, x);
 	VectorX::Sub(r, b, tmp);
-	
+
 	p = r;
-	float rsq = VectorX::Dot(r,r);
+	float rsq = VectorX::Dot(r, r);
 	for (int i = 0; i < numIterations; ++i)
 	{
 		SparseMat::Mul(Ap, A, p);
-		float alpha = rsq  / VectorX::Dot(p,Ap);
-		VectorX::MulAdd(x, p, alpha, x); // x = x + alpha*p
-		VectorX::MulAdd(r, Ap ,-alpha, r); // r = r - alpha*Ap
-		float rsqnew = VectorX::Dot(r,r);
-		if (fabs(rsqnew-rsq) < tolerance*n)
+		float alpha = rsq / VectorX::Dot(p, Ap);
+		VectorX::MulAdd(x, p, alpha, x);   // x = x + alpha*p
+		VectorX::MulAdd(r, Ap, -alpha, r); // r = r - alpha*Ap
+		float rsqnew = VectorX::Dot(r, r);
+		if (fabs(rsqnew - rsq) < tolerance * n)
 			break;
 		float beta = rsqnew / rsq;
-		VectorX::MulAdd(p, p, beta, r);// p = r + beta*p
+		VectorX::MulAdd(p, p, beta, r); // p = r + beta*p
 		rsq = rsqnew;
-	}	
+	}
 }
 
 struct PixelInfo
@@ -755,28 +875,28 @@ struct PixelInfo
 	Vec3 colorYCoCg;
 };
 
-void ComputePixelInfo(const std::vector<SeamEdge>& seamEdges, const array2d<uint8_t>& coverageBuf, const array2d<RGB>& image, std::vector<PixelInfo>& pixelInfo, array2d<int>& pixelToPixelInfoMap)
+void ComputePixelInfo(const std::vector<SeamEdge> &seamEdges, const array2d<uint8_t> &coverageBuf, const array2d<RGB> &image, std::vector<PixelInfo> &pixelInfo, array2d<int> &pixelToPixelInfoMap)
 {
 	// Find the pixels we will optimize for. Use a 2D map so that we can find a unique set of
-	// pixels that we need to optimize for, and a quick way to find the index of it given an (x,y) position. 
+	// pixels that we need to optimize for, and a quick way to find the index of it given an (x,y) position.
 	int W = coverageBuf.width;
 	int H = coverageBuf.height;
-	for (const auto&s : seamEdges)
+	for (const auto &s : seamEdges)
 	{
 		// TODO: this is overkill.. Could do conservative rasterization instead of brute force sampling
 		// 3x per pixel and take the union of the 2x2 sampling neighborhoods.
 		int numSamples = s.numSamples(W, H);
-		for (const auto& e : s.edges)
+		for (const auto &e : s.edges)
 		{
 			Vec2 e0 = UVToScreen(e.a, W, H);
-			Vec2 e1 = UVToScreen(e.b, W, H);		
-			Vec2 dt = (e1 - e0) / (float)(numSamples-1);
+			Vec2 e1 = UVToScreen(e.b, W, H);
+			Vec2 dt = (e1 - e0) / (float)(numSamples - 1);
 			Vec2 samplePoint = e0;
 			for (int i = 0; i < numSamples; ++i, samplePoint += dt)
 			{
 				// Go through the four bilinear sample taps
-				int xs[] = { (int)samplePoint.u, xs[0] + 1, xs[0] + 1, xs[0] };
-				int ys[] = { (int)samplePoint.v, ys[0]	, ys[0] + 1, ys[0] + 1 };
+				int xs[] = {(int)samplePoint.u, xs[0] + 1, xs[0] + 1, xs[0]};
+				int ys[] = {(int)samplePoint.v, ys[0], ys[0] + 1, ys[0] + 1};
 
 				for (int tap = 0; tap < 4; ++tap)
 				{
@@ -784,13 +904,13 @@ void ComputePixelInfo(const std::vector<SeamEdge>& seamEdges, const array2d<uint
 					int y = WrapCoordinate(ys[tap], H);
 
 					// If we haven't already seen this pixel, make sure we take this pixel into account when optimizing
-					if (pixelToPixelInfoMap(x,y) == -1)
+					if (pixelToPixelInfoMap(x, y) == -1)
 					{
-						bool isCovered = !!coverageBuf(x,y);
+						bool isCovered = !!coverageBuf(x, y);
 						Vec3 colorYCoCg;
 						if (isCovered)
 						{
-							colorYCoCg = RGBToYCoCg(image(x,y));
+							colorYCoCg = RGBToYCoCg(image(x, y));
 						}
 						else
 						{
@@ -798,8 +918,8 @@ void ComputePixelInfo(const std::vector<SeamEdge>& seamEdges, const array2d<uint
 							colorYCoCg = RGBToYCoCg(DilatePixel(x, y, image, coverageBuf));
 						}
 
-						pixelInfo.push_back(PixelInfo{ x,y, isCovered, colorYCoCg });
-						pixelToPixelInfoMap(x,y) = (int)pixelInfo.size() - 1;
+						pixelInfo.push_back(PixelInfo{x, y, isCovered, colorYCoCg});
+						pixelToPixelInfoMap(x, y) = (int)pixelInfo.size() - 1;
 					}
 				}
 			}
@@ -807,7 +927,7 @@ void ComputePixelInfo(const std::vector<SeamEdge>& seamEdges, const array2d<uint
 	}
 }
 
-void SetupLeastSquares(std::vector<SeamEdge> &seamEdges, const array2d<int>& pixelToPixelInfoMap, const std::vector<PixelInfo> &pixelInfo, SparseMat& AtA, VectorX &AtbR, VectorX &AtbG, VectorX &AtbB, VectorX& initialGuessR, VectorX& initialGuessG, VectorX& initialGuessB)
+void SetupLeastSquares(std::vector<SeamEdge> &seamEdges, const array2d<int> &pixelToPixelInfoMap, const std::vector<PixelInfo> &pixelInfo, SparseMat &AtA, VectorX &AtbR, VectorX &AtbG, VectorX &AtbB, VectorX &initialGuessR, VectorX &initialGuessG, VectorX &initialGuessB)
 {
 	int W = pixelToPixelInfoMap.width;
 	int H = pixelToPixelInfoMap.height;
@@ -815,7 +935,7 @@ void SetupLeastSquares(std::vector<SeamEdge> &seamEdges, const array2d<int>& pix
 	{
 		SeamEdge s = seamEdges[seamIndex];
 
-		// Step through the samples of this edge, and compute sample locations for each side of the seam		
+		// Step through the samples of this edge, and compute sample locations for each side of the seam
 		int numSamples = s.numSamples(W, H);
 
 		Vec2 firstHalfEdgeStart = UVToScreen(s.edges[0].a, W, H);
@@ -824,8 +944,8 @@ void SetupLeastSquares(std::vector<SeamEdge> &seamEdges, const array2d<int>& pix
 		Vec2 secondHalfEdgeStart = UVToScreen(s.edges[1].a, W, H);
 		Vec2 secondHalfEdgeEnd = UVToScreen(s.edges[1].b, W, H);
 
-		Vec2 firstHalfEdgeStep = (firstHalfEdgeEnd - firstHalfEdgeStart) / (float)(numSamples-1);
-		Vec2 secondHalfEdgeStep = (secondHalfEdgeEnd - secondHalfEdgeStart) / (float)(numSamples-1);
+		Vec2 firstHalfEdgeStep = (firstHalfEdgeEnd - firstHalfEdgeStart) / (float)(numSamples - 1);
+		Vec2 secondHalfEdgeStep = (secondHalfEdgeEnd - secondHalfEdgeStart) / (float)(numSamples - 1);
 
 		Vec2 firstHalfEdgeSample = firstHalfEdgeStart;
 		Vec2 secondHalfEdgeSample = secondHalfEdgeStart;
@@ -838,7 +958,7 @@ void SetupLeastSquares(std::vector<SeamEdge> &seamEdges, const array2d<int>& pix
 			CalculateSamplesAndWeights(pixelToPixelInfoMap, secondHalfEdgeSample, secondHalfEdge, secondHalfEdgeWeights);
 
 			/*
-			Now, compute the covariance for the difference of these two vectors.		
+			Now, compute the covariance for the difference of these two vectors.
 			If a is the first vector (first half edge) and b is the second, then we compute the covariance, without
 			intermediate storage, like so:
 			(a-b)*(a-b)^t = a*a^t + b*b^t - a*b^t-b*a^t
@@ -865,7 +985,7 @@ void SetupLeastSquares(std::vector<SeamEdge> &seamEdges, const array2d<int>& pix
 	for (size_t i = 0; i < pixelInfo.size(); ++i)
 	{
 		PixelInfo pi = pixelInfo[i];
-		
+
 		// Set up equality cost, trying to keep the pixel at its original value
 		// Note: for non-covered pixels the weight is much lower, since those are the pixels
 		// we primarily want to modify (we'll want to keep it >0 though, to reduce the risk
@@ -873,13 +993,13 @@ void SetupLeastSquares(std::vector<SeamEdge> &seamEdges, const array2d<int>& pix
 		float weight = pi.isCovered ? COVERED_PIXELS_WEIGHT : NONCOVERED_PIXELS_WEIGHT;
 		AtA(i, i) += weight;
 
-		// Set up the three right hand sides (one for R, G, and B). 
+		// Set up the three right hand sides (one for R, G, and B).
 		// Note AtRHS represents the transpose of the system matrix A multiplied by the RHS
 		AtbR[i] += pi.colorYCoCg.x * weight;
 		AtbG[i] += pi.colorYCoCg.y * weight;
 		AtbB[i] += pi.colorYCoCg.z * weight;
-	
-		// Set up the initial guess for the solution. 
+
+		// Set up the initial guess for the solution.
 		initialGuessR[i] = pi.colorYCoCg.x;
 		initialGuessG[i] = pi.colorYCoCg.y;
 		initialGuessB[i] = pi.colorYCoCg.z;
@@ -887,54 +1007,111 @@ void SetupLeastSquares(std::vector<SeamEdge> &seamEdges, const array2d<int>& pix
 }
 
 // Debugging function to check mesh data
-void DebugPrintMeshData(const Mesh& mesh) {
-	#undef min
-    // Print some vertices
-    std::cout << "Vertices (first 5 of " << mesh.verts.size() << "):" << std::endl;
-    for (size_t i = 0; i < std::min(mesh.verts.size(), size_t(5)); ++i) {
-        const auto& vert = mesh.verts[i];
-        std::cout << "(" << vert.x << ", " << vert.y << ", " << vert.z << ")" << std::endl;
-    }
+void DebugPrintMeshData(const Mesh &mesh)
+{
+#undef min
+	// Print some vertices
+	std::cout << "Vertices (first 5 of " << mesh.verts.size() << "):" << std::endl;
+	for (size_t i = 0; i < std::min(mesh.verts.size(), size_t(5)); ++i)
+	{
+		const auto &vert = mesh.verts[i];
+		std::cout << "(" << vert.x << ", " << vert.y << ", " << vert.z << ")" << std::endl;
+	}
 
-    // Print some UVs
-    std::cout << "UVs (first 5 of " << mesh.uvs.size() << "):" << std::endl;
-    for (size_t i = 0; i < std::min(mesh.uvs.size(), size_t(5)); ++i) {
-        const auto& uv = mesh.uvs[i];
-        std::cout << "(" << uv.u << ", " << uv.v << ")" << std::endl;
-    }
+	// Print some UVs
+	std::cout << "UVs (first 5 of " << mesh.uvs.size() << "):" << std::endl;
+	for (size_t i = 0; i < std::min(mesh.uvs.size(), size_t(5)); ++i)
+	{
+		const auto &uv = mesh.uvs[i];
+		std::cout << "(" << uv.u << ", " << uv.v << ")" << std::endl;
+	}
 
-    // Print some faces
-    std::cout << "Faces (first 5 of " << mesh.faces.size() << "):" << std::endl;
-    for (size_t i = 0; i < std::min(mesh.faces.size(), size_t(5)); ++i) {
-        const auto& face = mesh.faces[i];
-        std::cout << face.v0 << ", " << face.v1 << ", " << face.v2 << std::endl; // Modify according to your Face structure
-    }
+	// Print some faces
+	std::cout << "Faces (first 5 of " << mesh.faces.size() << "):" << std::endl;
+	for (size_t i = 0; i < std::min(mesh.faces.size(), size_t(5)); ++i)
+	{
+		const auto &face = mesh.faces[i];
+		std::cout << face.v0 << ", " << face.v1 << ", " << face.v2 << std::endl; // Modify according to your Face structure
+	}
+
+	// Print some edges
+	std::cout << "Edges (first 5 of " << mesh.edges.size() << "):" << std::endl;
+	for (size_t i = 0; i < std::min(mesh.edges.size(), size_t(5)); ++i)
+	{
+		const auto &edge = mesh.edges[i];
+		std::cout << edge.vertexIndex1 << ", " << edge.vertexIndex2 << std::endl;
+	}
 }
 
+bool ValidateMeshData(const Mesh &mesh)
+{
+	for (const auto &vert : mesh.verts)
+	{
+		if (std::isnan(vert.x) || std::isnan(vert.y) || std::isnan(vert.z) ||
+			std::isinf(vert.x) || std::isinf(vert.y) || std::isinf(vert.z))
+		{
+			std::cerr << "Invalid vertex data detected." << std::endl;
+			return false;
+		}
+	}
 
-bool ValidateMeshData(const Mesh& mesh) {
-    for (const auto& vert : mesh.verts) {
-        if(std::isnan(vert.x) || std::isnan(vert.y) || std::isnan(vert.z) || 
-			std::isinf(vert.x) || std::isinf(vert.y) || std::isinf(vert.z)) {
-            std::cerr << "Invalid vertex data detected." << std::endl;
-            return false;
-        }
-    }
+	for (const auto &uv : mesh.uvs)
+	{
+		if (std::isnan(uv.u) || std::isnan(uv.v) ||
+			std::isinf(uv.u) || std::isinf(uv.v))
+		{
+			std::cerr << "Invalid UV data detected." << std::endl;
+			return false;
+		}
+	}
 
-    for (const auto& uv : mesh.uvs) {
-        if(std::isnan(uv.u) || std::isnan(uv.v) || 
-			std::isinf(uv.u) || std::isinf(uv.v)) {
-            std::cerr << "Invalid UV data detected." << std::endl;
-            return false;
-        }
-    }
-    
-    // Additional checks can be added as per need
-    
-    return true;
+	// Additional checks can be added as per need
+
+	return true;
 }
 
-int main(int argc, char** argv)
+void DebugPrintMeshData(const Mesh &mesh, const std::string &filename)
+{
+	std::ofstream myfile(filename, std::ios::out); // Open file with filename, 'ios::out' means we're outputting to it
+
+	if (!myfile)
+	{ // Always check if the file is open
+		std::cerr << "File could not be opened!" << std::endl;
+		return;
+	}
+
+	// Vertices
+	myfile << "Vertices (" << mesh.verts.size() << " total):" << std::endl;
+	for (const auto &vert : mesh.verts)
+	{
+		myfile << "(" << vert.x << ", " << vert.y << ", " << vert.z << ")" << std::endl;
+	}
+
+	// UVs
+	myfile << "UVs (" << mesh.uvs.size() << " total):" << std::endl;
+	for (const auto &uv : mesh.uvs)
+	{
+		myfile << "(" << uv.u << ", " << uv.v << ")" << std::endl;
+	}
+
+	// Faces
+	myfile << "Faces (" << mesh.faces.size() << " total):" << std::endl;
+	for (const auto &face : mesh.faces)
+	{
+		myfile << face.v0 << ", " << face.v1 << ", " << face.v2 << std::endl;
+	}
+
+	// Edges
+	myfile << "Edges (" << mesh.edges.size() << " total):" << std::endl;
+	for (const auto &edge : mesh.edges)
+	{
+		myfile << edge.vertexIndex1 << ", " << edge.vertexIndex2 << std::endl;
+	}
+
+	myfile.close(); // Close the file
+}
+
+int main(int argc, char **argv)
 {
 	auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -943,9 +1120,9 @@ int main(int argc, char** argv)
 		printf("Usage: TextureBorderGenerator.exe InputMesh.glb InputTexture.png OutputTexture.png\n");
 		return -1;
 	}
-	const char* meshFileName = argv[1];
-	const char* texFileName = argv[2]; 
-	const char* texOutFileName = argv[3];
+	const char *meshFileName = argv[1];
+	const char *texFileName = argv[2];
+	const char *texOutFileName = argv[3];
 	Mesh mesh;
 
 	if (!LoadMesh(meshFileName, mesh))
@@ -954,14 +1131,16 @@ int main(int argc, char** argv)
 		return 1;
 	}
 
-	if (LoadMesh(meshFileName, mesh)) {
-    if (ValidateMeshData(mesh)) {
-        DebugPrintMeshData(mesh);
-    }
-}
+	if (LoadMesh(meshFileName, mesh))
+	{
+		if (ValidateMeshData(mesh))
+		{
+			DebugPrintMeshData(mesh);
+		}
+	}
 	int W, H, comp;
-
-	RGB* rawImg = (RGB*)stbi_load(texFileName, &W, &H, &comp, 3);
+	DebugPrintMeshData(mesh, "mesh_debug_output.txt");
+	RGB *rawImg = (RGB *)stbi_load(texFileName, &W, &H, &comp, 3);
 	if (rawImg == nullptr)
 	{
 		printf("Failed to load input texture!\n");
@@ -973,23 +1152,27 @@ int main(int argc, char** argv)
 	std::vector<SeamEdge> seamEdges;
 	FindSeamEdges(mesh, seamEdges, W, H);
 
-	// DBUG 
+	// DBUG
 	std::cout << "SeamEdges Size: " << seamEdges.size() << std::endl;
-	if(!seamEdges.empty()) {
+	if (!seamEdges.empty())
+	{
 		std::cout << "Sample SeamEdge, first half-edge a: ("
-		<< seamEdges[0].edges[0].a.u << ", " << seamEdges[0].edges[0].a.v << "), b: (" 
-		<< seamEdges[0].edges[0].b.u << ", " << seamEdges[0].edges[0].b.v << ")" << std::endl;
-
+				  << seamEdges[0].edges[0].a.u << ", " << seamEdges[0].edges[0].a.v << "), b: ("
+				  << seamEdges[0].edges[0].b.u << ", " << seamEdges[0].edges[0].b.v << ")" << std::endl;
 	}
 	// Produce a mask for all valid pixels
 	array2d<uint8_t> coverageBuf(W, H);
-	for (const auto& f : mesh.faces)
+	for (const auto &f : mesh.faces)
 	{
 		Vec2 uv0 = mesh.uvs[f.uv0], uv1 = mesh.uvs[f.uv1], uv2 = mesh.uvs[f.uv2];
 		RasterizeFace(uv0, uv1, uv2, coverageBuf);
 	}
-// debug line 
-
+	// debug line
+	if (!stbi_write_png("coverage_mask.png", W, H, 1, coverageBuf.data.get(), 0))
+	{
+		printf("Failed to write output file!\n");
+		return -1;
+	}
 #if 0
 	// Set pixels that aren't covered to an obvious color, so we can see errors
 	for (int j = 0; j < H; ++j)
@@ -1020,33 +1203,32 @@ int main(int argc, char** argv)
 	VectorX solutionR(numPixelsToOptimize), solutionG(numPixelsToOptimize), solutionB(numPixelsToOptimize);
 
 #pragma omp parallel sections
-{
-    #pragma omp section
-    {
-        ConjugateGradientOptimize(solutionR, AtA, initialGuessR, AtbR, 10000, TOLERANCE);
-    }
-    
-    #pragma omp section
-    {
-        ConjugateGradientOptimize(solutionG, AtA, initialGuessG, AtbG, 10000, TOLERANCE);
-    }
-    
-    #pragma omp section
-    {
-        ConjugateGradientOptimize(solutionB, AtA, initialGuessB, AtbB, 10000, TOLERANCE);
-    }
-}
+	{
+#pragma omp section
+		{
+			ConjugateGradientOptimize(solutionR, AtA, initialGuessR, AtbR, 10000, TOLERANCE);
+		}
 
+#pragma omp section
+		{
+			ConjugateGradientOptimize(solutionG, AtA, initialGuessG, AtbG, 10000, TOLERANCE);
+		}
+
+#pragma omp section
+		{
+			ConjugateGradientOptimize(solutionB, AtA, initialGuessB, AtbB, 10000, TOLERANCE);
+		}
+	}
 
 	// Store the resulting optimized pixels and save out
 	for (int i = 0; i < (int)numPixelsToOptimize; ++i)
 	{
 		PixelInfo pi = pixelInfo[i];
-		Vec3 colorYCoCg = Vec3{ solutionR[i], solutionG[i], solutionB[i] };
+		Vec3 colorYCoCg = Vec3{solutionR[i], solutionG[i], solutionB[i]};
 		image(pi.x, pi.y) = YCoCgToRGB(colorYCoCg);
 	}
 
-	if (!stbi_write_png(texOutFileName, W, H, 3, image.data.get(), sizeof(RGB)*W))
+	if (!stbi_write_png(texOutFileName, W, H, 3, image.data.get(), sizeof(RGB) * W))
 	{
 		printf("Failed to write output file!\n");
 		return -1;
@@ -1058,4 +1240,3 @@ int main(int argc, char** argv)
 	printf("Time: %.4f\n", elapsedSeconds.count());
 	return 0;
 }
-
