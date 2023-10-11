@@ -17,7 +17,7 @@ THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR I
 
 #include "../libs/stb/stb_image.h"
 #include "../libs/stb/stb_image_write.h"
-
+#include <tuple>
 #include <cstring>
 #include <memory>  // for std::unique_ptr
 #include <cstring> // for memcpy and memset
@@ -38,9 +38,9 @@ THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR I
 using namespace std;
 
 const float EDGE_CONSTRAINTS_WEIGHT = 5.0f;
-const float COVERED_PIXELS_WEIGHT = 2.0f;
+const float COVERED_PIXELS_WEIGHT = 1.0f;
 const float NONCOVERED_PIXELS_WEIGHT = 0.1f;
-const float TOLERANCE = 0.1f;
+const float TOLERANCE = 0.001;
 
 #define USE_ISPC 0
 
@@ -89,7 +89,7 @@ struct VectorX
 {
 	std::unique_ptr<float[]> vec;
 	size_t size;
-
+	
 	VectorX(const VectorX &other) : vec(new float[other.size]), size(other.size)
 	{
 		memcpy(vec.get(), other.vec.get(), size * sizeof(float));
@@ -161,7 +161,7 @@ struct VectorX
 
 			float dotProducts[NumChunks];
 #pragma omp parallel for
-			for (int i = 0; i < n; i++)
+			for (auto i = 0; i < NumChunks; i++) 
 			{
 				int count = i != NumChunks - 1 ? chunkSize : (int)n - chunkSize * (NumChunks - 1); // Treat last chunk separately
 				size_t start = i * chunkSize;
@@ -517,186 +517,248 @@ struct Mesh
 	std::vector<Edge> edges;
 };
 
+// OBJ loader
+
 bool LoadMesh(const char *fname, Mesh &mesh)
 {
-	tinygltf::Model model;
-	tinygltf::TinyGLTF loader;
-	std::string err;
-	std::string warn;
-
-	bool ret = loader.LoadBinaryFromFile(&model, &err, &warn, fname);
-
-	// Handle warnings and errors...
-
-	if (!ret)
-		return false;
-
-	// Assume the first mesh is the one you want
-	const tinygltf::Mesh &tmesh = model.meshes[0];
-
-	// Assume the first primitive is the one you want
-	const tinygltf::Primitive &prim = tmesh.primitives[0];
-
-	// Extracting vertices (as an example, assuming they are 3-component float)
+	FILE *f = fopen(fname, "r");
+	if (!f)
 	{
-		const tinygltf::Accessor &accessor = model.accessors[prim.attributes.find("POSITION")->second];
-		const tinygltf::BufferView &bufferView = model.bufferViews[accessor.bufferView];
-		const tinygltf::Buffer &buffer = model.buffers[bufferView.buffer];
-
-		const float *vertices = reinterpret_cast<const float *>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
-		size_t vertexCount = accessor.count;
-
-		for (size_t i = 0; i < vertexCount; i++)
-		{
-			mesh.verts.push_back(Vec3{vertices[i * 3 + 0], vertices[i * 3 + 1], vertices[i * 3 + 2]});
-		}
+		return false;
 	}
 
-	// Extracting UVs (similar to vertices)
-		// Extracting UVs
+	char buf[4096];
+	while (!feof(f))
 	{
-		auto itTexCoords = prim.attributes.find("TEXCOORD_0");
-		if (itTexCoords != prim.attributes.end())
+		float x, y, z;
+		int tri0, uv0, tri1, uv1, tri2, uv2, n0, n1, n2;
+		if (nullptr == fgets(buf, _countof(buf), f))
 		{
-			const tinygltf::Accessor &accessor = model.accessors[itTexCoords->second];
-			const tinygltf::BufferView &bufferView = model.bufferViews[accessor.bufferView];
-			const tinygltf::Buffer &buffer = model.buffers[bufferView.buffer];
+			break;
+		}
 
-			const float *texcoords = reinterpret_cast<const float *>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
-			size_t uvCount = accessor.count;
-
-			for (size_t i = 0; i < uvCount; i++)
-			{
-				mesh.uvs.push_back(Vec2{(texcoords[i * 2 + 0]), (texcoords[i * 2 + 1])});
-			}
+		if (sscanf_s(buf, "v %f %f %f", &x, &y, &z) == 3)
+		{
+			mesh.verts.push_back(Vec3{x, y, z});
+		}
+		else if (sscanf_s(buf, "vt %f %f", &x, &y) == 2)
+		{
+			mesh.uvs.push_back(Vec2{x, y});
+		}
+		else if (sscanf_s(buf, "f %d/%d/%d %d/%d/%d %d/%d/%d", &tri0, &uv0, &n0, &tri1, &uv1, &n1, &tri2, &uv2, &n2) == 9)
+		{
+			// TODO: Pretty sure OBJ has some weird "index from the back" thing too with negative indices.
+			assert(tri0 > 0);
+			assert(uv0 > 0);
+			assert(tri1 > 0);
+			assert(uv1 > 0);
+			assert(tri2 > 0);
+			assert(uv2 > 0);
+			mesh.faces.push_back(Face{tri0 - 1, tri1 - 1, tri2 - 1, uv0 - 1, uv1 - 1, uv2 - 1});
 		}
 		else
 		{
-			std::cerr << "Warning: No UV coordinates found in the mesh!" << std::endl;
+			// printf("INFO: Ignoring line: %s", buf);
 		}
 	}
 
-	// Extracting faces
-	{
-	const tinygltf::Accessor &accessor = model.accessors[prim.indices];
-	const tinygltf::BufferView &bufferView = model.bufferViews[accessor.bufferView];
-	const tinygltf::Buffer &buffer = model.buffers[bufferView.buffer];
-
-	const unsigned short *indices = reinterpret_cast<const unsigned short *>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
-	size_t indexCount = accessor.count;
-
-	for (size_t i = 0; i < indexCount; i += 3)
-	{
-		// Assuming UV indices are the same as vertex indices
-		mesh.faces.push_back(Face{
-			(int)indices[i + 0], 
-			(int)indices[i + 1], 
-			(int)indices[i + 2], 
-			(int)indices[i + 0], 
-			(int)indices[i + 1], 
-			(int)indices[i + 2]
-		});
-	}
-}
-
-
-	// Extracting edges
-	{
-		const tinygltf::Accessor &accessor = model.accessors[prim.indices];
-		const tinygltf::BufferView &bufferView = model.bufferViews[accessor.bufferView];
-		const tinygltf::Buffer &buffer = model.buffers[bufferView.buffer];
-		const float *positions = reinterpret_cast<const float *>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
-		const unsigned short *indices = reinterpret_cast<const unsigned short *>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
-		size_t indexCount = accessor.count;
-
-		for (size_t i = 0; i < indexCount; i += 3)
-		{
-			// Add face
-			mesh.faces.push_back(Face{indices[i + 0], indices[i + 1], indices[i + 2]});
-
-			// Get indices
-			int idx1 = indices[i + 0];
-			int idx2 = indices[i + 1];
-			int idx3 = indices[i + 2];
-
-			// Assuming each position is a set of 3 floats (x, y, z)
-			Vec3 pos1 = {positions[3 * idx1], positions[3 * idx1 + 1], positions[3 * idx1 + 2]};
-			Vec3 pos2 = {positions[3 * idx2], positions[3 * idx2 + 1], positions[3 * idx2 + 2]};
-			Vec3 pos3 = {positions[3 * idx3], positions[3 * idx3 + 1], positions[3 * idx3 + 2]};
-
-			// Add edges with positions
-			// NO unique , we add all
-			addUniqueEdgeWithPosition(idx1, idx2, pos1, pos2, mesh.edges);
-			addUniqueEdgeWithPosition(idx2, idx3, pos2, pos3, mesh.edges);
-			addUniqueEdgeWithPosition(idx3, idx1, pos3, pos1, mesh.edges);
-		}
-	}
-
-	// Handling normals, etc., involves similar steps.
-
+	fclose(f);
 	return true;
 }
 
+// gltf loader
+// bool LoadMesh(const char *fname, Mesh &mesh)
+// {
+// 	tinygltf::Model model;
+// 	tinygltf::TinyGLTF loader;
+// 	std::string err;
+// 	std::string warn;
+
+// 	bool ret = loader.LoadBinaryFromFile(&model, &err, &warn, fname);
+
+// 	// Handle warnings and errors...
+
+// 	if (!ret)
+// 		return false;
+
+// 	// Assume the first mesh is the one you want
+// 	const tinygltf::Mesh &tmesh = model.meshes[0];
+
+// 	// Assume the first primitive is the one you want
+// 	const tinygltf::Primitive &prim = tmesh.primitives[0];
+
+// 	// Extracting vertices (as an example, assuming they are 3-component float)
+// 	{
+// 		const tinygltf::Accessor &accessor = model.accessors[prim.attributes.find("POSITION")->second];
+// 		const tinygltf::BufferView &bufferView = model.bufferViews[accessor.bufferView];
+// 		const tinygltf::Buffer &buffer = model.buffers[bufferView.buffer];
+
+// 		const float *vertices = reinterpret_cast<const float *>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
+// 		size_t vertexCount = accessor.count;
+
+// 		for (size_t i = 0; i < vertexCount; i++)
+// 		{
+// 			mesh.verts.push_back(Vec3{vertices[i * 3 + 0], vertices[i * 3 + 1], vertices[i * 3 + 2]});
+// 		}
+// 	}
+
+// 	// Extracting UVs (similar to vertices)
+// 		// Extracting UVs
+// 	{
+// 		auto itTexCoords = prim.attributes.find("TEXCOORD_0");
+// 		if (itTexCoords != prim.attributes.end())
+// 		{
+// 			const tinygltf::Accessor &accessor = model.accessors[itTexCoords->second];
+// 			const tinygltf::BufferView &bufferView = model.bufferViews[accessor.bufferView];
+// 			const tinygltf::Buffer &buffer = model.buffers[bufferView.buffer];
+
+// 			const float *texcoords = reinterpret_cast<const float *>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
+// 			size_t uvCount = accessor.count;
+
+// 			for (size_t i = 0; i < uvCount; i++)
+// 			{
+// 				mesh.uvs.push_back(Vec2{(texcoords[i * 2 + 0]), (texcoords[i * 2 + 1])});
+// 			}
+// 		}
+// 		else
+// 		{
+// 			std::cerr << "Warning: No UV coordinates found in the mesh!" << std::endl;
+// 		}
+// 	}
+
+// 	// Extracting faces
+// 	{
+// 	const tinygltf::Accessor &accessor = model.accessors[prim.indices];
+// 	const tinygltf::BufferView &bufferView = model.bufferViews[accessor.bufferView];
+// 	const tinygltf::Buffer &buffer = model.buffers[bufferView.buffer];
+
+// 	const unsigned short *indices = reinterpret_cast<const unsigned short *>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
+// 	size_t indexCount = accessor.count;
+
+// 	for (size_t i = 0; i < indexCount; i += 3)
+// 	{
+// 		// Assuming UV indices are the same as vertex indices
+// 		mesh.faces.push_back(Face{
+// 			(int)indices[i + 0],
+// 			(int)indices[i + 1],
+// 			(int)indices[i + 2],
+// 			(int)indices[i + 0],
+// 			(int)indices[i + 1],
+// 			(int)indices[i + 2]
+// 		});
+// 	}
+// 	}
+
+// 	// Extracting edges
+// 	{
+// 		const tinygltf::Accessor &accessor = model.accessors[prim.indices];
+// 		const tinygltf::BufferView &bufferView = model.bufferViews[accessor.bufferView];
+// 		const tinygltf::Buffer &buffer = model.buffers[bufferView.buffer];
+// 		const float *positions = reinterpret_cast<const float *>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
+// 		const unsigned short *indices = reinterpret_cast<const unsigned short *>(&buffer.data[bufferView.byteOffset + accessor.byteOffset]);
+// 		size_t indexCount = accessor.count;
+
+// 		for (size_t i = 0; i < indexCount; i += 3)
+// 		{
+// 			// Add face
+// 			// mesh.faces.push_back(Face{indices[i + 0], indices[i + 1], indices[i + 2]});
+
+// 			// Get indices
+// 			int idx1 = indices[i + 0];
+// 			int idx2 = indices[i + 1];
+// 			int idx3 = indices[i + 2];
+
+// 			// Assuming each position is a set of 3 floats (x, y, z)
+// 			Vec3 pos1 = {positions[3 * idx1], positions[3 * idx1 + 1], positions[3 * idx1 + 2]};
+// 			Vec3 pos2 = {positions[3 * idx2], positions[3 * idx2 + 1], positions[3 * idx2 + 2]};
+// 			Vec3 pos3 = {positions[3 * idx3], positions[3 * idx3 + 1], positions[3 * idx3 + 2]};
+
+// 			// Add edges with positions
+// 			// NO unique , we add all
+// 			addUniqueEdgeWithPosition(idx1, idx2, pos1, pos2, mesh.edges);
+// 			addUniqueEdgeWithPosition(idx2, idx3, pos2, pos3, mesh.edges);
+// 			addUniqueEdgeWithPosition(idx3, idx1, pos3, pos1, mesh.edges);
+// 		}
+// 	}
+
+// 	// Handling normals, etc., involves similar steps.
+
+// 	return true;
+// }
+
 void FindSeamEdges(const Mesh &mesh, std::vector<SeamEdge> &seamEdges, int W, int H)
 {
-	std::ofstream logFile("seam.log", std::ios::app); // create a file stream
-    
-    if (!logFile) { // Check if file stream is in a valid state
-        std::cerr << "Could not open log file for writing!" << std::endl;
-        return;
-    } 
+	using namespace std;
+	// std::ofstream logFile("seam.log", std::ios::app); // create a file stream
 
-	if (mesh.edges.empty())
+	// if (!logFile)
+	// { // Check if file stream is in a valid state
+		// std::cerr << "Could not open log file for writing!" << std::endl;
+		// return;
+	// }
+
+	if (mesh.faces.empty())
 	{
-		std::cerr << "No edges in the mesh!" << std::endl;
+		std::cerr << "No faces in the mesh!" << std::endl;
 		return;
 	}
-
-	// edgeMap should map edges to their UVs
-	// depending on your Edge structure, this mapping might require a custom hash function
 	unordered_map<tuple<Vec3, Vec3>, tuple<Vec2, Vec2>, EdgeHasher> edgeMap;
 
-		for (const auto &e : mesh.edges)
+	for (const auto &f : mesh.faces)
+	{
+		// Need to loop through the edges of this face, so make a list of all the edges, including their UVs
+		tuple<int, int, int, int> edges[] = {
+			make_tuple(f.v0, f.v1, f.uv0, f.uv1),
+			make_tuple(f.v1, f.v2, f.uv1, f.uv2),
+			make_tuple(f.v2, f.v0, f.uv2, f.uv0)};
+
+		// edgeMap should map edges to their UVs
+		// depending on your Edge structure, this mapping might require a custom hash function
+
+
+		for (const auto &e : edges)
 		{
-			Vec3 v0 = e.pos1, v1 = e.pos2;
-			Vec2 uv0 = mesh.uvs[e.vertexIndex1], uv1 = mesh.uvs[e.vertexIndex2];
+			// Vec3 v0 = e.pos1, v1 = e.pos2;
+			// Vec2 uv0 = mesh.uvs[e.vertexIndex1], uv1 = mesh.uvs[e.vertexIndex2];
+			Vec3 v0 = mesh.verts[get<0>(e)], v1 = mesh.verts[get<1>(e)];
+			Vec2 uv0 = mesh.uvs[get<2>(e)], uv1 = mesh.uvs[get<3>(e)];
 
 			// Logging edge details
-            logFile << "Edge: v0: (" << v0.x << ", " << v0.y << ", " << v0.z << "), v1: (" << v1.x << ", " << v1.y << ", " << v1.z << ")" << std::endl;
-            logFile << "UVs: uv0: (" << uv0.u << ", " << uv0.v << "), uv1: (" << uv1.u << ", " << uv1.v << ")" << std::endl;
-			// Inspecting edgeMap: Print out every key-value pair in edgeMap
+			// logFile << "Edge: v0: (" << v0.x << ", " << v0.y << ", " << v0.z << "), v1: (" << v1.x << ", " << v1.y << ", " << v1.z << ")" << std::endl;
+			// logFile << "UVs: uv0: (" << uv0.u << ", " << uv0.v << "), uv1: (" << uv1.u << ", " << uv1.v << ")" << std::endl;
+			// // Inspecting edgeMap: Print out every key-value pair in edgeMap
 
-			auto otherEdge = edgeMap.find(make_tuple(v1, v0));
+			auto otherEdge = edgeMap.find(std::make_tuple(v1, v0));
 			if (otherEdge == edgeMap.end())
 			{
-				logFile << "Adding" <<  std::endl;
-				edgeMap[make_tuple(v0, v1)] = make_tuple(uv0, uv1);
+				// logFile << "Adding" << std::endl;
+				edgeMap[std::make_tuple(v0, v1)] = std::make_tuple(uv0, uv1);
 			}
 			else
 			{
 				// std::cout << "FOUND A DUPLICATE !!" <<  std::endl;
 				// Check if UVs are the same; if not, it's a seam
-				Vec2 otherUv0 = get<0>(otherEdge->second), otherUv1 = get<1>(otherEdge->second);
-				logFile << "Other UVs: otherUv0: (" << otherUv0.u << ", " << otherUv0.v << "), otherUv1: (" << otherUv1.u << ", " << otherUv1.v << ")" << std::endl;
-				if (otherUv0.u != uv1.u || otherUv0.v != uv1.v || otherUv1.u != uv0.u || otherUv1.v != uv0.v)
+				Vec2 otheruv0 = get<0>(otherEdge->second), otheruv1 = get<1>(otherEdge->second);
+				// logFile << "Other UVs: otherUv0: (" << otheruv0.u << ", " << otheruv0.v << "), otherUv1: (" << otheruv1.u << ", " << otheruv1.v << ")" << std::endl;
+				if (otheruv0 != uv1 || otheruv1 != uv0)
 
 				{
 
-					logFile << "FOUND A SEAM " << std::endl;
+					// logFile << "FOUND A SEAM " << std::endl;
 					// This is a seam, handle it accordingly
-					SeamEdge s = SeamEdge{HalfEdge{uv0, uv1}, HalfEdge{otherUv1, otherUv0}};
+					SeamEdge s = SeamEdge{HalfEdge{uv0, uv1}, HalfEdge{otheruv1, otheruv0}};
 					seamEdges.push_back(s);
-					logFile << "Sample SeamEdge, first half-edge a: ("
-						<< seamEdges[0].edges[0].a.u << ", " << seamEdges[0].edges[0].a.v << "), b: ("
-						<< seamEdges[0].edges[0].b.u << ", " << seamEdges[0].edges[0].b.v << ")" << std::endl;
+					// logFile << "Sample SeamEdge, first half-edge a: ("
+							// << seamEdges[0].edges[0].a.u << ", " << seamEdges[0].edges[0].a.v << "), b: ("
+							// << seamEdges[0].edges[0].b.u << ", " << seamEdges[0].edges[0].b.v << ")" << std::endl;
 				}
 
 				// Optionally remove the edge from the map if you no longer need it
-				// edgeMap.erase(otherEdge);
+				edgeMap.erase(otherEdge);
 			}
 		}
-	
-	 logFile.close();  // make sure to close the file stream when done writing
+	}
+	// logFile.close(); // make sure to close the file stream when done writing
 }
 
 struct RGB
@@ -1009,15 +1071,18 @@ void SetupLeastSquares(std::vector<SeamEdge> &seamEdges, const array2d<int> &pix
 // Debugging function to check mesh data
 void DebugPrintMeshData(const Mesh &mesh)
 {
+	
 #undef min
 	// Print some vertices
+
 	std::cout << "Vertices (first 5 of " << mesh.verts.size() << "):" << std::endl;
 	for (size_t i = 0; i < std::min(mesh.verts.size(), size_t(5)); ++i)
 	{
 		const auto &vert = mesh.verts[i];
 		std::cout << "(" << vert.x << ", " << vert.y << ", " << vert.z << ")" << std::endl;
 	}
-
+	// std::cout << "vert404 pos" << mesh.verts[404].x << mesh.verts[404].y << mesh.verts[404].z << std::endl;
+	// std::cout << "vert404 uv" << mesh.uvs[359].u << mesh.uvs[359].v  << std::endl;
 	// Print some UVs
 	std::cout << "UVs (first 5 of " << mesh.uvs.size() << "):" << std::endl;
 	for (size_t i = 0; i < std::min(mesh.uvs.size(), size_t(5)); ++i)
