@@ -89,7 +89,7 @@ struct VectorX
 {
 	std::unique_ptr<float[]> vec;
 	size_t size;
-	
+
 	VectorX(const VectorX &other) : vec(new float[other.size]), size(other.size)
 	{
 		memcpy(vec.get(), other.vec.get(), size * sizeof(float));
@@ -161,7 +161,7 @@ struct VectorX
 
 			float dotProducts[NumChunks];
 #pragma omp parallel for
-			for (auto i = 0; i < NumChunks; i++) 
+			for (auto i = 0; i < NumChunks; i++)
 			{
 				int count = i != NumChunks - 1 ? chunkSize : (int)n - chunkSize * (NumChunks - 1); // Treat last chunk separately
 				size_t start = i * chunkSize;
@@ -518,7 +518,6 @@ struct Mesh
 };
 
 // OBJ loader
-
 bool LoadMesh(const char *fname, Mesh &mesh)
 {
 	FILE *f = fopen(fname, "r");
@@ -567,6 +566,7 @@ bool LoadMesh(const char *fname, Mesh &mesh)
 }
 
 // gltf loader
+
 // bool LoadMesh(const char *fname, Mesh &mesh)
 // {
 // 	tinygltf::Model model;
@@ -686,6 +686,7 @@ bool LoadMesh(const char *fname, Mesh &mesh)
 // 	return true;
 // }
 
+//working of finding seams
 void FindSeamEdges(const Mesh &mesh, std::vector<SeamEdge> &seamEdges, int W, int H)
 {
 	using namespace std;
@@ -693,8 +694,8 @@ void FindSeamEdges(const Mesh &mesh, std::vector<SeamEdge> &seamEdges, int W, in
 
 	// if (!logFile)
 	// { // Check if file stream is in a valid state
-		// std::cerr << "Could not open log file for writing!" << std::endl;
-		// return;
+	// std::cerr << "Could not open log file for writing!" << std::endl;
+	// return;
 	// }
 
 	if (mesh.faces.empty())
@@ -714,7 +715,6 @@ void FindSeamEdges(const Mesh &mesh, std::vector<SeamEdge> &seamEdges, int W, in
 
 		// edgeMap should map edges to their UVs
 		// depending on your Edge structure, this mapping might require a custom hash function
-
 
 		for (const auto &e : edges)
 		{
@@ -749,8 +749,8 @@ void FindSeamEdges(const Mesh &mesh, std::vector<SeamEdge> &seamEdges, int W, in
 					SeamEdge s = SeamEdge{HalfEdge{uv0, uv1}, HalfEdge{otheruv1, otheruv0}};
 					seamEdges.push_back(s);
 					// logFile << "Sample SeamEdge, first half-edge a: ("
-							// << seamEdges[0].edges[0].a.u << ", " << seamEdges[0].edges[0].a.v << "), b: ("
-							// << seamEdges[0].edges[0].b.u << ", " << seamEdges[0].edges[0].b.v << ")" << std::endl;
+					// << seamEdges[0].edges[0].a.u << ", " << seamEdges[0].edges[0].a.v << "), b: ("
+					// << seamEdges[0].edges[0].b.u << ", " << seamEdges[0].edges[0].b.v << ")" << std::endl;
 				}
 
 				// Optionally remove the edge from the map if you no longer need it
@@ -829,7 +829,7 @@ void RasterizeFace(Vec2 uv0, Vec2 uv1, Vec2 uv2, array2d<uint8_t> &coverageBuf)
 		{
 			if (isInside(x, y, e0a, e0b) & isInside(x, y, e1a, e1b) & isInside(x, y, e2a, e2b))
 			{
-				coverageBuf(WrapCoordinate(x, coverageBuf.width), WrapCoordinate(y, coverageBuf.height)) = 1;
+				coverageBuf(WrapCoordinate(x, coverageBuf.width), WrapCoordinate(y, coverageBuf.height)) = 255;
 			}
 		}
 	}
@@ -1071,7 +1071,7 @@ void SetupLeastSquares(std::vector<SeamEdge> &seamEdges, const array2d<int> &pix
 // Debugging function to check mesh data
 void DebugPrintMeshData(const Mesh &mesh)
 {
-	
+
 #undef min
 	// Print some vertices
 
