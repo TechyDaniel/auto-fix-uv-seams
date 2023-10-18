@@ -21,6 +21,7 @@ class Mesh:
         self.faces = []
 
 
+# Alternatively we can use tinyGltf lib to load GLB
 def load_mesh(fname):
     mesh = Mesh()
 
@@ -121,8 +122,8 @@ def calculate_step_size(total_edge_seams):
 
 
 def encode_seam_color(seam_count, edge_seams):
+    "Give each seam pair an unique color"
     step_size = calculate_step_size(edge_seams)
-    print(step_size)
     # Determine the number of possible values for each channel given the step size
     values_per_channel = 256 // step_size
 
@@ -136,7 +137,6 @@ def encode_seam_color(seam_count, edge_seams):
     g = green_cycles * step_size
     b = blue_cycles * step_size
 
-    print(seam_count, r, g, b)
     return (r, g, b)
 
 
@@ -146,7 +146,7 @@ def main(obj_filename):
 
     # A counter for the seam pairs to encode the RGB value
     seam_count = 1
-    print(len(edge_seams))
+
     for seam in edge_seams:
         seam.color = encode_seam_color(seam_count, len(edge_seams))
         seam_count += 1
