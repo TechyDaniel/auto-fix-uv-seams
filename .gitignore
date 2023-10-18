@@ -3,4 +3,3 @@ libs/*
 data/*
 !data/.gitkeep
 .vscode/*
-Python/*
