@@ -281,7 +281,7 @@ def create_mask_from_line(start, end, img_width, img_height, rect_width=4):
     dy = end[1] - start[1]
 
     # Normalize the direction vector
-    length = math.sqrt(dx * dx + dy * dy)
+    length = np.sqrt(dx * dx + dy * dy)
     dx /= length
     dy /= length
 
@@ -299,14 +299,72 @@ def create_mask_from_line(start, end, img_width, img_height, rect_width=4):
     # Create a blank mask
     mask = Image.new("L", (img_width, img_height), 0)
 
-    # Draw the rectangle on the mask
+    # Draw the gradient rectangle on the mask
     draw = ImageDraw.Draw(mask)
-    draw.polygon([p1, p2, p3, p4], fill=127)
+
+    # Create a linear gradient from 255 to 0
+    gradient = np.linspace(0, 255, rect_width)
+
+    for i in range(rect_width):
+        intensity = int(gradient[i])
+        fill_color = (intensity,)
+        draw.polygon([p1, p2, p3, p4], fill=fill_color)
+
+        # Update corners for next iteration
+        p1 = (p1[0] + nx, p1[1] + ny)
+        p2 = (p2[0] + nx, p2[1] + ny)
+        p3 = (p3[0] + nx, p3[1] + ny)
+        p4 = (p4[0] + nx, p4[1] + ny)
 
     return mask
 
 
-def create_mask_from_line_reverse(A_screen, B_screen, W, H, width=5, power=4):
+def create_mask_from_line_reversed(start, end, img_width, img_height, rect_width=4):
+    # Calculate the direction vector of the line
+    dx = start[0] - end[0]
+    dy = start[1] - end[1]
+
+    # Normalize the direction vector
+    length = np.sqrt(dx * dx + dy * dy)
+    dx /= length
+    dy /= length
+
+    # Calculate the normal to the line (perpendicular)
+    nx = -dy
+    ny = dx
+
+    # Calculate the four corners of the rectangle
+    half_width = rect_width / 2.0
+    p1 = (start[0] - nx * half_width, start[1] - ny * half_width)
+    p2 = (start[0] + nx * half_width, start[1] + ny * half_width)
+    p3 = (end[0] + nx * half_width, end[1] + ny * half_width)
+    p4 = (end[0] - nx * half_width, end[1] - ny * half_width)
+
+    # Create a blank mask
+    mask = Image.new("L", (img_width, img_height), 0)
+
+    # Draw the gradient rectangle on the mask
+    draw = ImageDraw.Draw(mask)
+
+    # Create a linear gradient from 255 to 0
+    gradient = np.linspace(0, 255, rect_width)
+
+    for i in range(rect_width):
+        intensity = int(gradient[i])
+        fill_color = (intensity,)
+        draw.polygon([p1, p2, p3, p4], fill=fill_color)
+
+        # Update corners for next iteration
+        p1 = (p1[0] + nx, p1[1] + ny)
+        p2 = (p2[0] + nx, p2[1] + ny)
+        p3 = (p3[0] + nx, p3[1] + ny)
+        p4 = (p4[0] + nx, p4[1] + ny)
+
+    return mask
+
+
+# This old funtion draws line by line whoch have aliasing issues
+def create_mask_from_line_reverse_OLD(A_screen, B_screen, W, H, width=5, power=4):
     mask = Image.new("L", (W, H), 0)
     draw = ImageDraw.Draw(mask)
 
@@ -841,7 +899,7 @@ def pack_uv_mask_into_texture(azimuth_altitude_img, uv_mask):
     return packed_image
 
 
-def transform_image(image, seam_edge):
+def transform_image(image, seam_edge, px_width=10):
     W, H = image.width, image.height
     image_np = np.array(image)
 
@@ -854,33 +912,14 @@ def transform_image(image, seam_edge):
             UVToScreen(np.array(seam.edges[0].b), W, H),
         ]
 
-        # # Step 1: Flip the UVs
-        # flipped_a_src = (1.0 - seam.edges[0].a[0], seam.edges[0].a[1])
-        # flipped_b_src = (1.0 - seam.edges[0].b[0], seam.edges[0].b[1])
-
-        # # Step 2: Convert these flipped UVs to screen coordinates using UVToScreen
-        # src_x_flipped = [
-        #     UVToScreen(np.array(flipped_a_src), W, H),
-        #     UVToScreen(np.array(flipped_b_src), W, H),
-        # ]
-
         dst = [
             UVToScreen(np.array(seam.edges[1].a), W, H),
             UVToScreen(np.array(seam.edges[1].b), W, H),
         ]
-        # # Step 1: Flip the UVs
-        # flipped_a_dst = (1.0 - seam.edges[1].a[0], seam.edges[1].a[1])
-        # flipped_b_dst = (1.0 - seam.edges[1].b[0], seam.edges[1].b[1])
-
-        # # Step 2: Convert these flipped UVs to screen coordinates using UVToScreen
-        # dst_x_flipped = [
-        #     UVToScreen(np.array(flipped_a_dst), W, H),
-        #     UVToScreen(np.array(flipped_b_dst), W, H),
-        # ]
 
         M_1 = get_affine_matrix(dst, src)
 
-        single_mask_1 = create_mask_from_line(dst[0], dst[1], W, H)
+        single_mask_1 = create_mask_from_line_reversed(dst[0], dst[1], W, H, px_width)
 
         # single_mask.show()
         # Convert the single_mask Image object to a numpy array and normalize it
@@ -909,35 +948,15 @@ def transform_image(image, seam_edge):
             UVToScreen(np.array(seam.edges[0].b), W, H),
         ]
 
-        # # Step 1: Flip the UVs
-        # flipped_a_src = (1.0 - seam.edges[0].a[0], seam.edges[0].a[1])
-        # flipped_b_src = (1.0 - seam.edges[0].b[0], seam.edges[0].b[1])
-
-        # # Step 2: Convert these flipped UVs to screen coordinates using UVToScreen
-        # src_x_flipped = [
-        #     UVToScreen(np.array(flipped_a_src), W, H),
-        #     UVToScreen(np.array(flipped_b_src), W, H),
-        # ]
-
         dst = [
             UVToScreen(np.array(seam.edges[1].a), W, H),
             UVToScreen(np.array(seam.edges[1].b), W, H),
         ]
-        # # Step 1: Flip the UVs
-        # flipped_a_dst = (1.0 - seam.edges[1].a[0], seam.edges[1].a[1])
-        # flipped_b_dst = (1.0 - seam.edges[1].b[0], seam.edges[1].b[1])
-
-        # # Step 2: Convert these flipped UVs to screen coordinates using UVToScreen
-        # dst_x_flipped = [
-        #     UVToScreen(np.array(flipped_a_dst), W, H),
-        #     UVToScreen(np.array(flipped_b_dst), W, H),
-        # ]
 
         M_2 = get_affine_matrix(src, dst)
 
-        single_mask_2 = create_mask_from_line(src[0], src[1], W, H)
+        single_mask_2 = create_mask_from_line(src[0], src[1], W, H, px_width)
 
-        # single_mask.show()
         # Convert the single_mask Image object to a numpy array and normalize it
         mask_np_2 = np.array(single_mask_2).astype(float) / 255.0
         # Apply the transformation
@@ -987,7 +1006,7 @@ def main(obj_filename="InputMesh.glb"):
     # sdf_mask = generate_sdf_from_image(uv_mask)
     # az_alt_map = encode_normal_to_azimuth_altitude(normal_texture)
     # packed_azimuth_uv_mask = pack_uv_mask_into_texture(az_alt_map, uv_mask)
-    test = transform_image(diffuse_texture, edge_seams)
+    test = transform_image(diffuse_texture, edge_seams, 8)
 
     # Saving maps
     # seam_map.save("seam_map.png")
