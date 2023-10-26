@@ -232,6 +232,33 @@ def WrapCoordinate(x, size):
     return x
 
 
+def is_point_in_triangle(pt, v0, v1, v2):
+    """
+    Check if a point is inside a triangle in 2D (UV) space.
+    """
+    # Check if the point is on the "inside" side of all the triangle's edges
+    return (
+        isInside(pt[0], pt[1], v0, v1)
+        and isInside(pt[0], pt[1], v1, v2)
+        and isInside(pt[0], pt[1], v2, v0)
+    )
+
+
+def compute_barycentric_coords_vectorized(pt, v0, v1, v2):
+    """
+    Compute the barycentric coordinates of a point within a triangle.
+    """
+    detT = (v1[1] - v2[1]) * (v0[0] - v2[0]) + (v2[0] - v1[0]) * (v0[1] - v2[1])
+    alpha = (
+        (v1[1] - v2[1]) * (pt[..., 0] - v2[0]) + (v2[0] - v1[0]) * (pt[..., 1] - v2[1])
+    ) / detT
+    beta = (
+        (v2[1] - v0[1]) * (pt[..., 0] - v2[0]) + (v0[0] - v2[0]) * (pt[..., 1] - v2[1])
+    ) / detT
+    gamma = 1.0 - alpha - beta
+    return np.stack([alpha, beta, gamma], axis=-1)
+
+
 def RasterizeFace(uv0, uv1, uv2, coverageBuf):
     """
     Rasterizes a triangle defined by three UV coordinates onto a coverage buffer, filling its interior.
@@ -979,6 +1006,94 @@ def transform_image(image, seam_edge, px_width=10):
     return Image.fromarray(image_np)
 
 
+def compute_object_space_normals(mesh):
+    """
+    Compute the object space normals for a mesh.
+
+    Args:
+        mesh (trimesh.Trimesh): The input mesh.
+
+    Returns:
+        np.ndarray: Array of object space normals for each vertex.
+    """
+    normals = np.zeros_like(mesh.verts)
+
+    for face in mesh.faces:
+        # Calculate the triangle's normal
+        v0, v1, v2 = mesh.verts[face]
+        normal = np.cross(v1 - v0, v2 - v0)
+        normal /= np.linalg.norm(normal)  # Normalize
+
+        # Assign/accumulate the triangle's normal to its vertices
+        normals[face] += normal
+
+    # Normalize the accumulated normals
+    for i in range(len(normals)):
+        normals[i] /= np.linalg.norm(normals[i])
+
+    return normals
+
+
+def bake_object_space_normals(mesh, object_space_normals, image):
+    """
+    Bake the object space normals of a mesh into a 2D texture map.
+
+    Args:
+        mesh (trimesh.Trimesh): The input mesh.
+        uv_data (np.array): The UV coordinates of the mesh vertices.
+        image_size (tuple): Size of the target image as (width, height).
+
+    Returns:
+        np.ndarray: Baked normal map.
+    """
+    uv_data = mesh.uvs
+    W, H = image.size
+
+    # Compute object space normals
+    normals = object_space_normals
+
+    # Flatten UV space to compute barycentric coordinates for all points
+    y, x = np.mgrid[:H, :W]
+    uv_points = np.column_stack((x.ravel(), y.ravel()))
+
+    # Normalize UV points
+    uv_points_normalized = np.column_stack(
+        (uv_points[:, 0] / W, 1 - uv_points[:, 1] / H)
+    )
+
+    baked_normals = np.zeros((W * H, 3), dtype=np.float32)
+
+    for face in mesh.faces:
+        v0_uv, v1_uv, v2_uv = uv_data[face]
+        bcoords = compute_barycentric_coords_vectorized(
+            uv_points_normalized, v0_uv, v1_uv, v2_uv
+        )
+
+        # Mask for the points inside the triangle
+        mask = np.all((bcoords >= 0) & (bcoords <= 1), axis=1)
+
+        # Use broadcasting to compute the interpolated normals for all relevant UVs
+        interpolated_normals = (
+            bcoords[mask][:, 0, np.newaxis] * normals[face[0]]
+            + bcoords[mask][:, 1, np.newaxis] * normals[face[1]]
+            + bcoords[mask][:, 2, np.newaxis] * normals[face[2]]
+        )
+
+        # Normalize the interpolated normals
+        normalized_normals = (
+            interpolated_normals
+            / np.linalg.norm(interpolated_normals, axis=1)[:, np.newaxis]
+        )
+        baked_normals[mask] = normalized_normals
+
+    # Reshape the flattened array back to image dimensions
+    baked_normals = baked_normals.reshape(H, W, 3)
+
+    # Normalize the normals to fit in [0, 1] range
+    baked_normals = 0.5 * (baked_normals + 1)
+    return (baked_normals * 255).astype(np.uint8)
+
+
 def main(obj_filename="InputMesh.glb"):
     """
     Generate visualization assets from a 3D model to streamline the texture mapping process.
@@ -998,28 +1113,42 @@ def main(obj_filename="InputMesh.glb"):
     diffuse_texture = load_image_diffuse_glb(obj_filename)
     normal_texture = load_image_normal_glb(obj_filename)
 
+    object_space_normals = compute_object_space_normals(mesh)
+
     # Generating maps
     edge_seams = find_seam_edges_glb(mesh)
 
-    # seam_map = generate_seam_map(edge_seams, diffuse_texture)
-    # uv_mask = generate_uv_mask(mesh, diffuse_texture)
-    # sdf_mask = generate_sdf_from_image(uv_mask)
-    # az_alt_map = encode_normal_to_azimuth_altitude(normal_texture)
-    # packed_azimuth_uv_mask = pack_uv_mask_into_texture(az_alt_map, uv_mask)
-    test = transform_image(diffuse_texture, edge_seams, 8)
+    seam_map = generate_seam_map(edge_seams, diffuse_texture)
+    uv_mask = generate_uv_mask(mesh, diffuse_texture)
+    sdf_mask = generate_sdf_from_image(uv_mask)
+
+    baked_normals_image = bake_object_space_normals(
+        mesh, object_space_normals, diffuse_texture
+    )
+
+    # image should be only at the end
+
+    Object_normal = Image.fromarray(baked_normals_image)
+
+    az_alt_map = encode_normal_to_azimuth_altitude(Object_normal)
+    packed_azimuth_uv_mask = pack_uv_mask_into_texture(az_alt_map, uv_mask)
+    # test = transform_image(
+    #     diffuse_texture, edge_seams, 8
+    # )  # the last param indicates the edge thickness
 
     # Saving maps
-    # seam_map.save("seam_map.png")
-    # uv_mask.save("uv_mask.png")
-    # sdf_mask.save("sdf_mask.png")
-    # az_alt_map.save("azimuth_altitute_map.png")
+    seam_map.save("seam_map.png")
+    uv_mask.save("uv_mask.png")
+    sdf_mask.save("sdf_mask.png")
+    az_alt_map.save("azimuth_altitute_map.png")
     normal_texture.save("normal_texture.png")
     diffuse_texture.save("diffuse_texture.png")
-    # packed_azimuth_uv_mask.save("packed_az_uv_mask.png")
+    Object_normal.save("Object_normal.png")
+    packed_azimuth_uv_mask.save("packed_az_uv_mask.png")
 
     # Visualizing
-    test.save("test.png")
-    test.show()
+    # test.save()
+    # test.show()
 
 
 if __name__ == "__main__":
